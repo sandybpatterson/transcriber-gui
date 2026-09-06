@@ -27,6 +27,13 @@ from ui.results_view import ResultsView
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi")
 
 
+def _format_hms(seconds: float) -> str:
+    total = int(seconds)
+    m, s = divmod(total, 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
 class DropZone(QLabel):
     """A label that accepts a dragged-and-dropped video file."""
 
@@ -209,7 +216,8 @@ class MainWindow(QMainWindow):
             return wrapper
 
         thread.started.connect(worker.run)
-        worker.progress.connect(guarded(self.status_label.setText))
+        worker.progress.connect(guarded(self._on_phase_message))
+        worker.segment_progress.connect(guarded(self._on_segment_progress))
         worker.segment_ready.connect(guarded(self.results_view.add_segment))
         worker.finished.connect(guarded(self._on_transcription_finished))
         worker.failed.connect(guarded(self._on_transcription_failed))
@@ -314,6 +322,21 @@ class MainWindow(QMainWindow):
                 self._thread.deleteLater()
         self._worker = None
         self._thread = None
+
+    def _on_phase_message(self, message: str) -> None:
+        # Reset to indeterminate for phases with no known progress (extraction,
+        # diarization) -- _on_segment_progress switches it to determinate once
+        # transcription starts reporting real percentages.
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText(message)
+
+    def _on_segment_progress(self, percent: int, seconds_done: float, total_seconds: float) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(percent)
+        self.status_label.setText(
+            f"Transcribing... {percent}% "
+            f"({_format_hms(seconds_done)} / {_format_hms(total_seconds)})"
+        )
 
     def _on_transcription_finished(self, segments) -> None:
         self.results_view.set_segments(segments)

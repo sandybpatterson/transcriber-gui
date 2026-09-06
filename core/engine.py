@@ -70,6 +70,15 @@ def extract_audio(video_path: str, output_dir: Optional[str] = None) -> str:
     return str(audio_path)
 
 
+def _wav_duration_seconds(path: str) -> float:
+    """Total duration of a WAV file, for estimating transcription progress."""
+    import wave
+
+    with wave.open(path, "rb") as wf:
+        rate = wf.getframerate()
+        return wf.getnframes() / float(rate) if rate else 0.0
+
+
 def transcribe_audio(
     audio_path: str,
     model_size: str = "base",
@@ -105,6 +114,7 @@ class TranscriptionWorker(QObject):
     """Runs extract -> transcribe -> (optional) diarize on a background thread."""
 
     progress = Signal(str)
+    segment_progress = Signal(int, float, float)  # percent, seconds done, total seconds
     segment_ready = Signal(object)
     finished = Signal(list)
     failed = Signal(str)
@@ -141,9 +151,13 @@ class TranscriptionWorker(QObject):
             self._check_cancelled()
 
             self.progress.emit("Transcribing...")
+            total_duration = _wav_duration_seconds(audio_path)
 
             def on_segment(seg: Segment) -> None:
                 self.segment_ready.emit(seg)
+                if total_duration > 0:
+                    percent = max(0, min(100, int(seg.end / total_duration * 100)))
+                    self.segment_progress.emit(percent, seg.end, total_duration)
                 self._check_cancelled()
 
             segments = transcribe_audio(
