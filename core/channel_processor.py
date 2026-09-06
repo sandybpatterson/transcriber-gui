@@ -7,6 +7,7 @@ than feeding a live results table.
 """
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +18,8 @@ from PySide6.QtCore import QObject, Signal
 from core.channel_watcher import find_new_videos, list_channels, mark_seen
 from core.engine import TranscriptionCancelled, download_audio, transcribe_audio
 from exporters import export_txt
+
+logger = logging.getLogger(__name__)
 
 
 def _unique_path(directory: Path, stem: str, suffix: str) -> Path:
@@ -65,6 +68,7 @@ class ChannelCheckWorker(QObject):
             raise TranscriptionCancelled()
 
     def run(self) -> None:
+        logger.info("Channel check starting (diarize=%s)", self.diarize)
         try:
             if self.diarize and not (self.hf_token or os.environ.get("HF_TOKEN")):
                 raise RuntimeError(
@@ -98,6 +102,7 @@ class ChannelCheckWorker(QObject):
             for channel_url, video in queue:
                 self._check_cancelled()
                 self.log.emit(f"Processing: {video['title']}")
+                logger.info("Processing video %s (%s)", video["id"], video["title"])
                 try:
                     self._process_one(video)
                     mark_seen(channel_url, video["id"])
@@ -105,13 +110,17 @@ class ChannelCheckWorker(QObject):
                 except TranscriptionCancelled:
                     raise
                 except Exception as exc:  # noqa: BLE001 - log and move on to the next video
+                    logger.exception("Failed processing video %s", video["id"])
                     self.log.emit(f"  Failed ({exc}) -- will retry next check.")
 
             self.log.emit(f"Done. {processed} of {len(queue)} new video(s) transcribed.")
+            logger.info("Channel check finished: %d/%d processed", processed, len(queue))
             self.finished.emit(processed)
         except TranscriptionCancelled:
+            logger.info("Channel check cancelled by user")
             self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
+            logger.exception("Channel check failed")
             self.failed.emit(str(exc))
 
     def _process_one(self, video: dict) -> None:

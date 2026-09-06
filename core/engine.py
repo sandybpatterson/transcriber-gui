@@ -6,6 +6,7 @@ plain function usable and testable on its own.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from typing import Callable, Optional
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, Signal
+
+logger = logging.getLogger(__name__)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -201,6 +204,10 @@ class TranscriptionWorker(QObject):
     def run(self) -> None:
         download_dir: Optional[tempfile.TemporaryDirectory] = None
         extracted_audio_path: Optional[str] = None
+        logger.info(
+            "Transcription starting: video_path=%s model=%s language=%s diarize=%s",
+            self.video_path, self.model_size, self.language, self.diarize,
+        )
         try:
             if is_url(self.video_path):
                 self.progress.emit("Downloading audio...")
@@ -239,6 +246,7 @@ class TranscriptionWorker(QObject):
                 on_segment=on_segment,
             )
             self._check_cancelled()
+            logger.info("Transcription produced %d segment(s)", len(segments))
 
             if self.diarize:
                 # Without a token, pyannote's gated-model download fails
@@ -252,18 +260,23 @@ class TranscriptionWorker(QObject):
                         "Speaker identification needs a free Hugging Face token. "
                         "Add one in the app (next to the diarization checkbox) and try again."
                     )
+                logger.info("Starting diarization")
                 self.progress.emit("Identifying speakers...")
                 from core.diarization import assign_speakers, diarize_audio
 
                 speaker_segments = diarize_audio(audio_path, hf_token=self.hf_token)
                 segments = assign_speakers(segments, speaker_segments)
                 self._check_cancelled()
+                logger.info("Diarization found %d speaker turn(s)", len(speaker_segments))
 
             self.progress.emit("Done.")
+            logger.info("Transcription finished successfully")
             self.finished.emit(segments)
         except TranscriptionCancelled:
+            logger.info("Transcription cancelled by user")
             self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
+            logger.exception("Transcription failed")
             self.failed.emit(str(exc))
         finally:
             if download_dir is not None:

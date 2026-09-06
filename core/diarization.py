@@ -1,12 +1,18 @@
 """Optional speaker-diarization pass using pyannote.audio."""
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
 from core.engine import Segment
+
+logger = logging.getLogger(__name__)
+
+TOKEN_CHECK_TIMEOUT_SECONDS = 30
 
 # Both models are gated on Hugging Face (confirmed directly: downloading
 # even their small config.yaml fails with GatedRepoError when unauthorized)
@@ -27,6 +33,7 @@ def check_hf_token(token: str) -> None:
     """
     from huggingface_hub import HfApi, hf_hub_download
 
+    logger.info("Checking Hugging Face token (whoami)")
     # HF's gated-repo error text ("...must be authenticated... please log
     # in") reads the same whether the token itself is wrong or the token
     # is fine but just hasn't been granted access to that specific repo --
@@ -35,21 +42,27 @@ def check_hf_token(token: str) -> None:
     try:
         HfApi().whoami(token=token)
     except Exception as exc:  # noqa: BLE001 - surface Hugging Face's own reason
+        logger.warning("Token failed whoami check: %s", exc)
         raise RuntimeError(
             f"That token itself isn't valid: {exc}\n\n"
             "Double-check it was copied in full with no missing characters, "
             "or create a new one at https://huggingface.co/settings/tokens."
         ) from exc
+    logger.info("Token passed whoami check")
 
     for repo_id in REQUIRED_REPOS:
+        logger.info("Checking access to %s", repo_id)
         try:
             hf_hub_download(repo_id, "config.yaml", token=token)
         except Exception as exc:  # noqa: BLE001 - surface whatever Hugging Face actually said
+            logger.warning("No access to %s: %s", repo_id, exc)
             raise RuntimeError(
                 f"Can't access {repo_id} yet: {exc}\n\n"
                 f"Visit https://huggingface.co/{repo_id} while logged in and "
                 "request/accept access, then test again."
             ) from exc
+        logger.info("Access to %s confirmed", repo_id)
+    logger.info("Token check passed for all required repos")
 
 
 class HfTokenTestWorker(QObject):
@@ -64,11 +77,47 @@ class HfTokenTestWorker(QObject):
         self.token = token
 
     def run(self) -> None:
-        try:
-            check_hf_token(self.token)
+        # check_hf_token() ultimately calls huggingface_hub's whoami(),
+        # which was found -- by direct testing -- to pass no timeout at
+        # all to its underlying HTTP request, and isn't governed by
+        # HF_HUB_DOWNLOAD_TIMEOUT either (that only covers the actual
+        # download path). socket.setdefaulttimeout() doesn't help here
+        # either: also confirmed directly, requests/urllib3 explicitly
+        # sets timeout=None on the socket when none is given, which
+        # overrides the global default. A hard external deadline via a
+        # background thread is the only thing that actually bounds this.
+        #
+        # Uses a plain daemon thread rather than
+        # concurrent.futures.ThreadPoolExecutor -- also confirmed
+        # directly: the executor registers a global atexit hook that
+        # joins every thread it ever created regardless of an individual
+        # shutdown(wait=False) call, so a still-stuck call would prevent
+        # the whole app process from ever fully exiting, even after the
+        # window is closed. A daemon thread carries no such join-on-exit
+        # behavior -- it's simply abandoned.
+        result: dict = {}
+
+        def target() -> None:
+            try:
+                check_hf_token(self.token)
+                result["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - message already formatted by check_hf_token
+                result["error"] = str(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=TOKEN_CHECK_TIMEOUT_SECONDS)
+
+        if thread.is_alive():
+            logger.warning("Token check timed out after %ds", TOKEN_CHECK_TIMEOUT_SECONDS)
+            self.failed.emit(
+                f"Timed out after {TOKEN_CHECK_TIMEOUT_SECONDS}s checking your token. "
+                "Hugging Face may be slow or unreachable right now -- try again in a moment."
+            )
+        elif "error" in result:
+            self.failed.emit(result["error"])
+        else:
             self.succeeded.emit()
-        except Exception as exc:  # noqa: BLE001 - message already formatted by check_hf_token
-            self.failed.emit(str(exc))
 
 
 def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple[float, float, str]]:
@@ -81,10 +130,12 @@ def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple
     from pyannote.audio import Pipeline
 
     token = hf_token or os.environ.get("HF_TOKEN")
+    logger.info("Loading pyannote diarization pipeline")
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         use_auth_token=token,
     )
+    logger.info("Running diarization on %s", audio_path)
     diarization = pipeline(audio_path)
 
     return [

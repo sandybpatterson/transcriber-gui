@@ -7,9 +7,12 @@ video ids have already been seen so repeat checks only surface new ones.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Only the most recent videos are fetched per check -- channels list
 # newest-first, and a long-running show can have 1000+ episodes in its
@@ -58,6 +61,7 @@ def _fetch_recent_videos(channel_url: str) -> tuple[str, list[dict]]:
 def add_channel(channel_url: str) -> dict:
     """Fetches the channel's current videos and baselines all of them as
     already-seen -- only videos published after this point count as new."""
+    logger.info("Adding channel: %s", channel_url)
     name, entries = _fetch_recent_videos(channel_url)
     registry = _load_registry()
     registry["channels"][channel_url] = {
@@ -65,10 +69,12 @@ def add_channel(channel_url: str) -> dict:
         "seen_ids": [e["id"] for e in entries],
     }
     _save_registry(registry)
+    logger.info("Added channel %r (%s) with %d baseline video(s)", name, channel_url, len(entries))
     return registry["channels"][channel_url]
 
 
 def remove_channel(channel_url: str) -> None:
+    logger.info("Removing channel: %s", channel_url)
     registry = _load_registry()
     registry["channels"].pop(channel_url, None)
     _save_registry(registry)
@@ -85,6 +91,7 @@ def find_new_videos(channel_url: str) -> list[dict]:
     _, entries = _fetch_recent_videos(channel_url)
     new_entries = [e for e in entries if e["id"] not in seen]
     new_entries.reverse()
+    logger.info("%s: %d new video(s) found", channel_url, len(new_entries))
     return [
         {"id": e["id"], "title": e.get("title") or e["id"], "url": f"https://www.youtube.com/watch?v={e['id']}"}
         for e in new_entries
