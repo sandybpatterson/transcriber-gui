@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
+from ui.channel_manager_dialog import ChannelManagerDialog
 from ui.results_view import ResultsView
 from ui.speaker_rename_dialog import SpeakerRenameDialog
 
@@ -98,6 +99,7 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._autosave_path: Optional[Path] = None
         self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
+        self._channel_dialog: Optional[ChannelManagerDialog] = None
 
         self._build_ui()
         self.hf_token_input.setText(self._settings.value("hf_token", "", type=str))
@@ -130,6 +132,13 @@ class MainWindow(QMainWindow):
         use_url_button.clicked.connect(self._use_url)
         url_row.addWidget(use_url_button)
         layout.addLayout(url_row)
+
+        channels_row = QHBoxLayout()
+        channels_row.addStretch(1)
+        watch_channels_button = QPushButton("Watch YouTube Channels...")
+        watch_channels_button.clicked.connect(self._open_channel_manager)
+        channels_row.addWidget(watch_channels_button)
+        layout.addLayout(channels_row)
 
         options_row = QHBoxLayout()
 
@@ -251,6 +260,23 @@ class MainWindow(QMainWindow):
 
     def _save_hf_token(self) -> None:
         self._settings.setValue("hf_token", self.hf_token_input.text().strip())
+
+    def _open_channel_manager(self) -> None:
+        self._save_hf_token()
+        language = LANGUAGES.get(self.language_combo.currentText())
+        diarize = self.diarize_checkbox.isChecked()
+        hf_token = self.hf_token_input.text().strip() or None
+        if self._channel_dialog is None:
+            self._channel_dialog = ChannelManagerDialog(
+                self, self.model_combo.currentText(), language, diarize, hf_token
+            )
+        else:
+            self._channel_dialog.update_transcription_settings(
+                self.model_combo.currentText(), language, diarize, hf_token
+            )
+        self._channel_dialog.show()
+        self._channel_dialog.raise_()
+        self._channel_dialog.activateWindow()
 
     # ------------------------------------------------------------------
     # Transcription
