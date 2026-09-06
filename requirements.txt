@@ -1,0 +1,8 @@
+PySide6
+faster-whisper
+pyannote.audio
+ffmpeg-python
+python-docx
+# Provides a portable ffmpeg binary, auto-downloaded on first use, so users
+# never need ffmpeg on their own PATH.
+imageio-ffmpeg
