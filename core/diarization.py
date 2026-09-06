@@ -4,7 +4,57 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from PySide6.QtCore import QObject, Signal
+
 from core.engine import Segment
+
+# Both models are gated on Hugging Face (confirmed directly: downloading
+# even their small config.yaml fails with GatedRepoError when unauthorized)
+# -- segmentation-3.0 is a dependency pyannote's pipeline loads internally,
+# so a token needs access to both, not just the one named in diarize_audio.
+REQUIRED_REPOS = ("pyannote/speaker-diarization-3.1", "pyannote/segmentation-3.0")
+
+
+def check_hf_token(token: str) -> None:
+    """Verifies `token` can actually access both gated models this needs.
+
+    Downloads just each repo's small config.yaml rather than the full
+    pipeline (which would also pull in real model weights) -- enough to
+    trigger the same gate check a full pipeline load would hit, much
+    faster. Raises with a message naming the specific blocking repo and a
+    link to it on success partial failure; returns normally if both are
+    reachable.
+    """
+    from huggingface_hub import hf_hub_download
+
+    for repo_id in REQUIRED_REPOS:
+        try:
+            hf_hub_download(repo_id, "config.yaml", token=token)
+        except Exception as exc:  # noqa: BLE001 - surface whatever Hugging Face actually said
+            raise RuntimeError(
+                f"Can't access {repo_id} yet: {exc}\n\n"
+                f"Visit https://huggingface.co/{repo_id} while logged in and "
+                "request/accept access, then test again."
+            ) from exc
+
+
+class HfTokenTestWorker(QObject):
+    """Runs check_hf_token() on a background thread so the UI doesn't
+    block on the network calls it makes."""
+
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, token: str):
+        super().__init__()
+        self.token = token
+
+    def run(self) -> None:
+        try:
+            check_hf_token(self.token)
+            self.succeeded.emit()
+        except Exception as exc:  # noqa: BLE001 - message already formatted by check_hf_token
+            self.failed.emit(str(exc))
 
 
 def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple[float, float, str]]:

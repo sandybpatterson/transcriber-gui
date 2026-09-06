@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.diarization import HfTokenTestWorker
 from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.channel_manager_dialog import ChannelManagerDialog
@@ -100,6 +101,8 @@ class MainWindow(QMainWindow):
         self._autosave_path: Optional[Path] = None
         self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
         self._channel_dialog: Optional[ChannelManagerDialog] = None
+        self._token_test_thread: Optional[QThread] = None
+        self._token_test_worker: Optional[HfTokenTestWorker] = None
 
         self._build_ui()
         self.hf_token_input.setText(self._settings.value("hf_token", "", type=str))
@@ -165,34 +168,60 @@ class MainWindow(QMainWindow):
         self.diarize_panel = QWidget()
         diarize_layout = QVBoxLayout(self.diarize_panel)
         diarize_layout.setContentsMargins(20, 0, 0, 8)
+
+        # --- setup state: shown until the pasted token is actually verified ---
+        self.diarize_setup_widget = QWidget()
+        setup_layout = QVBoxLayout(self.diarize_setup_widget)
+        setup_layout.setContentsMargins(0, 0, 0, 0)
         setup_info = QLabel(
             "Needs a free Hugging Face token (one-time setup):<br>"
             "1. Create a free account: <a href=\"https://huggingface.co/join\">huggingface.co/join</a><br>"
-            "2. While logged in, accept terms for both models this needs:<br>"
+            "2. While logged in, open these two model pages (both are gated) and "
+            "request/accept access if prompted:<br>"
             "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/speaker-diarization-3.1\">"
-            "pyannote/speaker-diarization-3.1</a> (click \"Agree and access repository\")<br>"
+            "pyannote/speaker-diarization-3.1</a><br>"
             "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/segmentation-3.0\">"
-            "pyannote/segmentation-3.0</a> (same, this is a dependency of the model above)<br>"
+            "pyannote/segmentation-3.0</a> (a dependency of the model above)<br>"
             "3. Create a token (\"Read\" access is enough): "
             "<a href=\"https://huggingface.co/settings/tokens\">huggingface.co/settings/tokens</a><br>"
-            "4. Paste it below -- it's remembered after that."
+            "4. Paste it below and click \"Test &amp; Save\"."
         )
         setup_info.setOpenExternalLinks(True)
         setup_info.setWordWrap(True)
-        diarize_layout.addWidget(setup_info)
+        setup_layout.addWidget(setup_info)
 
         token_row = QHBoxLayout()
         token_row.addWidget(QLabel("Hugging Face token:"))
         self.hf_token_input = QLineEdit()
         self.hf_token_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.hf_token_input.setPlaceholderText("hf_...")
-        self.hf_token_input.editingFinished.connect(self._save_hf_token)
         token_row.addWidget(self.hf_token_input, stretch=1)
-        diarize_layout.addLayout(token_row)
+        self.hf_token_test_button = QPushButton("Test && Save")
+        self.hf_token_test_button.clicked.connect(self._test_hf_token)
+        token_row.addWidget(self.hf_token_test_button)
+        setup_layout.addLayout(token_row)
+
+        self.hf_token_status_label = QLabel("")
+        self.hf_token_status_label.setWordWrap(True)
+        self.hf_token_status_label.setOpenExternalLinks(True)
+        setup_layout.addWidget(self.hf_token_status_label)
+
+        diarize_layout.addWidget(self.diarize_setup_widget)
+
+        # --- verified state: collapses the above once the token actually works ---
+        self.diarize_verified_widget = QWidget()
+        verified_layout = QHBoxLayout(self.diarize_verified_widget)
+        verified_layout.setContentsMargins(0, 0, 0, 0)
+        verified_layout.addWidget(QLabel("Hugging Face token verified."))
+        change_token_button = QPushButton("Change...")
+        change_token_button.clicked.connect(self._edit_hf_token)
+        verified_layout.addWidget(change_token_button)
+        verified_layout.addStretch(1)
+        diarize_layout.addWidget(self.diarize_verified_widget)
 
         layout.addWidget(self.diarize_panel)
         self.diarize_panel.setVisible(False)
-        self.diarize_checkbox.toggled.connect(self.diarize_panel.setVisible)
+        self.diarize_checkbox.toggled.connect(self._on_diarize_toggled)
 
         start_row = QHBoxLayout()
         self.start_button = QPushButton("Start transcription")
@@ -260,6 +289,78 @@ class MainWindow(QMainWindow):
 
     def _save_hf_token(self) -> None:
         self._settings.setValue("hf_token", self.hf_token_input.text().strip())
+
+    def _on_diarize_toggled(self, checked: bool) -> None:
+        self.diarize_panel.setVisible(checked)
+        if checked:
+            self._refresh_diarize_setup_state()
+
+    def _refresh_diarize_setup_state(self) -> None:
+        # "Verified" means this exact token string already passed a real
+        # access check -- editing the field at all falls back to setup
+        # state, since the new value hasn't been tested yet.
+        token = self.hf_token_input.text().strip()
+        verified_token = self._settings.value("hf_token_verified_value", "", type=str)
+        is_verified = bool(token) and token == verified_token
+        self.diarize_setup_widget.setVisible(not is_verified)
+        self.diarize_verified_widget.setVisible(is_verified)
+
+    def _edit_hf_token(self) -> None:
+        self.hf_token_status_label.setText("")
+        self.diarize_setup_widget.setVisible(True)
+        self.diarize_verified_widget.setVisible(False)
+
+    def _test_hf_token(self) -> None:
+        token = self.hf_token_input.text().strip()
+        if not token:
+            self.hf_token_status_label.setText("Paste a token first.")
+            return
+
+        self.hf_token_test_button.setEnabled(False)
+        self.hf_token_status_label.setText("Checking access to both required models...")
+
+        self._token_test_worker = HfTokenTestWorker(token)
+        self._token_test_thread = QThread()
+        self._token_test_worker.moveToThread(self._token_test_thread)
+        worker = self._token_test_worker
+        thread = self._token_test_thread
+
+        # Real bound methods + self.sender() guards -- see the note in
+        # _start_transcription for why a closure-wrapped connection here
+        # would silently run the handler on the wrong thread instead.
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_token_test_succeeded)
+        worker.failed.connect(self._on_token_test_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._cleanup_token_test_thread)
+
+        thread.start()
+
+    def _on_token_test_succeeded(self) -> None:
+        if self.sender() is not self._token_test_worker:
+            return
+        token = self.hf_token_input.text().strip()
+        self._settings.setValue("hf_token", token)
+        self._settings.setValue("hf_token_verified_value", token)
+        self.hf_token_status_label.setText("")
+        self._refresh_diarize_setup_state()
+
+    def _on_token_test_failed(self, message: str) -> None:
+        if self.sender() is not self._token_test_worker:
+            return
+        self.hf_token_status_label.setText(message)
+
+    def _cleanup_token_test_thread(self) -> None:
+        if self.sender() is not self._token_test_thread:
+            return
+        self.hf_token_test_button.setEnabled(True)
+        if self._token_test_worker is not None:
+            self._token_test_worker.deleteLater()
+        if self._token_test_thread is not None:
+            self._token_test_thread.deleteLater()
+        self._token_test_worker = None
+        self._token_test_thread = None
 
     def _open_channel_manager(self) -> None:
         self._save_hf_token()
