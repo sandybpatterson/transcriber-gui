@@ -241,6 +241,17 @@ class TranscriptionWorker(QObject):
             self._check_cancelled()
 
             if self.diarize:
+                # Without a token, pyannote's gated-model download fails
+                # authentication -- but that can surface as a confusing
+                # stall rather than a clear error depending on how the
+                # underlying HTTP client retries. Checked here, before
+                # starting, so the failure is immediate and explains itself
+                # instead of leaving the run looking hung.
+                if not (self.hf_token or os.environ.get("HF_TOKEN")):
+                    raise RuntimeError(
+                        "Speaker identification needs a free Hugging Face token. "
+                        "Add one in the app (next to the diarization checkbox) and try again."
+                    )
                 self.progress.emit("Identifying speakers...")
                 from core.diarization import assign_speakers, diarize_audio
 

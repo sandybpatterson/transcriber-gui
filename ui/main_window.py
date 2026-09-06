@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.results_view import ResultsView
+from ui.speaker_rename_dialog import SpeakerRenameDialog
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi")
 AUTOSAVE_DIR = Path.home() / "Documents" / "TranscriberGUI Autosaves"
@@ -96,8 +97,10 @@ class MainWindow(QMainWindow):
         self._worker: Optional[TranscriptionWorker] = None
         self._thread: Optional[QThread] = None
         self._autosave_path: Optional[Path] = None
+        self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
 
         self._build_ui()
+        self.hf_token_input.setText(self._settings.value("hf_token", "", type=str))
 
     # ------------------------------------------------------------------
     # UI construction
@@ -149,6 +152,38 @@ class MainWindow(QMainWindow):
 
         self.diarize_checkbox = QCheckBox("Identify speakers (diarization)")
         layout.addWidget(self.diarize_checkbox)
+
+        self.diarize_panel = QWidget()
+        diarize_layout = QVBoxLayout(self.diarize_panel)
+        diarize_layout.setContentsMargins(20, 0, 0, 8)
+        setup_info = QLabel(
+            "Needs a free Hugging Face token (one-time setup):<br>"
+            "1. Create a free account: <a href=\"https://huggingface.co/join\">huggingface.co/join</a><br>"
+            "2. While logged in, accept terms for both models this needs:<br>"
+            "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/speaker-diarization-3.1\">"
+            "pyannote/speaker-diarization-3.1</a> (click \"Agree and access repository\")<br>"
+            "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/segmentation-3.0\">"
+            "pyannote/segmentation-3.0</a> (same, this is a dependency of the model above)<br>"
+            "3. Create a token (\"Read\" access is enough): "
+            "<a href=\"https://huggingface.co/settings/tokens\">huggingface.co/settings/tokens</a><br>"
+            "4. Paste it below -- it's remembered after that."
+        )
+        setup_info.setOpenExternalLinks(True)
+        setup_info.setWordWrap(True)
+        diarize_layout.addWidget(setup_info)
+
+        token_row = QHBoxLayout()
+        token_row.addWidget(QLabel("Hugging Face token:"))
+        self.hf_token_input = QLineEdit()
+        self.hf_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.hf_token_input.setPlaceholderText("hf_...")
+        self.hf_token_input.editingFinished.connect(self._save_hf_token)
+        token_row.addWidget(self.hf_token_input, stretch=1)
+        diarize_layout.addLayout(token_row)
+
+        layout.addWidget(self.diarize_panel)
+        self.diarize_panel.setVisible(False)
+        self.diarize_checkbox.toggled.connect(self.diarize_panel.setVisible)
 
         start_row = QHBoxLayout()
         self.start_button = QPushButton("Start transcription")
@@ -214,6 +249,9 @@ class MainWindow(QMainWindow):
         self.file_label.setText(path if is_url(path) else Path(path).name)
         self.start_button.setEnabled(True)
 
+    def _save_hf_token(self) -> None:
+        self._settings.setValue("hf_token", self.hf_token_input.text().strip())
+
     # ------------------------------------------------------------------
     # Transcription
     # ------------------------------------------------------------------
@@ -236,11 +274,13 @@ class MainWindow(QMainWindow):
             AUTOSAVE_DIR, _slugify(_fallback_name(self.video_path)), ".txt"
         )
 
+        self._save_hf_token()
         self._worker = TranscriptionWorker(
             video_path=self.video_path,
             model_size=self.model_combo.currentText(),
             language=language,
             diarize=self.diarize_checkbox.isChecked(),
+            hf_token=self.hf_token_input.text().strip() or None,
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -424,9 +464,38 @@ class MainWindow(QMainWindow):
     def _on_transcription_finished(self, segments) -> None:
         if self.sender() is not self._worker:
             return
+        self._maybe_rename_speakers(segments)
         self.results_view.set_segments(segments)
         self.status_label.setText(f"Done — {len(segments)} segments.")
         self._set_export_enabled(bool(segments))
+
+    def _maybe_rename_speakers(self, segments) -> None:
+        examples: dict[str, list[str]] = {}
+        for segment in segments:
+            if not segment.speaker:
+                continue
+            bucket = examples.setdefault(segment.speaker, [])
+            if len(bucket) < 2:
+                text = segment.text.strip()
+                bucket.append(text if len(text) <= 80 else text[:77] + "...")
+        if not examples:
+            return
+
+        dialog = SpeakerRenameDialog(examples, self)
+        accepted = dialog.exec()
+        if not accepted:
+            return  # Cancel: leave the original SPEAKER_NN labels as transcribed.
+
+        rename_map = dialog.rename_map()
+        for segment in segments:
+            if segment.speaker in rename_map:
+                segment.speaker = rename_map[segment.speaker]
+
+        if self._autosave_path is not None:
+            try:
+                export_txt(segments, str(self._autosave_path))
+            except OSError:
+                pass
 
     def _on_transcription_failed(self, message: str) -> None:
         if self.sender() is not self._worker:
