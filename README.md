@@ -1,0 +1,2 @@
+# transcriber-gui
+Scribe bot 
