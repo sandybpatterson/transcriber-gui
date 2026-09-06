@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -109,10 +109,17 @@ class MainWindow(QMainWindow):
         self.diarize_checkbox = QCheckBox("Identify speakers (diarization)")
         layout.addWidget(self.diarize_checkbox)
 
+        start_row = QHBoxLayout()
         self.start_button = QPushButton("Start transcription")
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self._start_transcription)
-        layout.addWidget(self.start_button)
+        start_row.addWidget(self.start_button, stretch=1)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self._cancel_transcription)
+        start_row.addWidget(self.cancel_button)
+        layout.addLayout(start_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
@@ -167,6 +174,8 @@ class MainWindow(QMainWindow):
         self.results_view.clear()
         self._set_export_enabled(False)
         self.start_button.setEnabled(False)
+        self.cancel_button.setVisible(True)
+        self.cancel_button.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.status_label.setText("Starting...")
 
@@ -181,24 +190,128 @@ class MainWindow(QMainWindow):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
 
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self.status_label.setText)
-        self._worker.segment_ready.connect(self.results_view.add_segment)
-        self._worker.finished.connect(self._on_transcription_finished)
-        self._worker.failed.connect(self._on_transcription_failed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._cleanup_thread)
+        # A force-stopped worker's OS thread can't reliably be disconnected
+        # either (see _force_stop_if_still_running) — disconnect() blocks the
+        # same way wait() does against a thread with no cancellation point.
+        # So instead of relying on disconnecting a stale worker, every handler
+        # that touches UI state is guarded: it checks the emitting worker is
+        # still *the* current one before doing anything. A signal from an
+        # abandoned worker that fires late is then simply inert, with no
+        # blocking call required to make it so.
+        worker = self._worker
+        thread = self._thread
 
-        self._thread.start()
+        def guarded(handler):
+            def wrapper(*args):
+                if self._worker is worker:
+                    handler(*args)
+
+            return wrapper
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(guarded(self.status_label.setText))
+        worker.segment_ready.connect(guarded(self.results_view.add_segment))
+        worker.finished.connect(guarded(self._on_transcription_finished))
+        worker.failed.connect(guarded(self._on_transcription_failed))
+        worker.cancelled.connect(guarded(self._on_transcription_cancelled))
+        # These three only tell the worker's own thread to quit -- harmless
+        # even if stale, and bound to this specific thread regardless.
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(guarded(self._cleanup_thread))
+
+        thread.start()
+
+    def _cancel_transcription(self) -> None:
+        if self._worker is None or self._thread is None:
+            return
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Cancelling...")
+        self._worker.request_cancel()
+
+        # The worker checks for cancellation between pipeline steps, but it can
+        # also be stuck in a single blocking call (a model download with a dead
+        # connection, a very slow ffmpeg run) that never reaches a checkpoint.
+        # Give it a couple of seconds to stop cleanly, then force it — but only
+        # this specific run, in case a new one has since been started.
+        watched_thread = self._thread
+        watched_worker = self._worker
+        QTimer.singleShot(
+            2500, lambda: self._force_stop_if_still_running(watched_thread, watched_worker)
+        )
+
+    def _force_stop_if_still_running(self, watched_thread: QThread, watched_worker: TranscriptionWorker) -> None:
+        if self._thread is not watched_thread or not watched_thread.isRunning():
+            return
+
+        # terminate() asks the OS to kill the thread, but a thread with no
+        # cancellation point (a tight compute loop, some native calls) may
+        # never actually respond to it. Critically, QThread.wait() is *not*
+        # reliably bounded by its own timeout in that case either — measured
+        # directly, wait(1000) can simply never return. So this never blocks
+        # the GUI thread waiting for confirmation: terminate(), detach right
+        # away, and let a non-blocking poll finish the cleanup later if the
+        # OS thread ever actually dies.
+        watched_thread.terminate()
+
+        # No disconnect() call here on purpose: it carries the exact same
+        # risk as wait() above -- confirmed directly, it can block just as
+        # indefinitely against a thread with no cancellation point. Safety
+        # against a late signal from this abandoned worker instead comes
+        # from the identity guard set up in _start_transcription, which
+        # needs no blocking call at all.
+        #
+        # Known residual limitation: if the worker thread is truly never
+        # yielding the GIL at all (a tight pure-Python or non-releasing
+        # native loop with no I/O), even this UI update can be delayed
+        # behind it -- an inherent constraint of CPython's single GIL, not
+        # something fixable from the application side short of moving
+        # transcription into a separate process. In practice this doesn't
+        # come up: ffmpeg extraction is subprocess/I/O-bound and faster-
+        # whisper's native inference releases the GIL during computation
+        # the same way blocking I/O does, so real hangs behave like the
+        # network-stall / slow-I/O case this mechanism was built for.
+        self.status_label.setText(
+            "Cancelled — the background task could not be confirmed stopped "
+            "and may still be finishing silently. Safe to start another one."
+        )
+        self._set_export_enabled(bool(self.results_view.segments()))
+        self._detach_thread(delete=False)
+        self._poll_for_stale_thread_cleanup(watched_thread, watched_worker, attempts_left=30)
+
+    def _poll_for_stale_thread_cleanup(self, thread: QThread, worker: TranscriptionWorker, attempts_left: int) -> None:
+        """Best-effort deferred cleanup for a thread abandoned by force-stop.
+
+        Never blocks: only ever polls isRunning(), which is safe, unlike wait().
+        """
+        if not thread.isRunning():
+            thread.deleteLater()
+            worker.deleteLater()
+            return
+        if attempts_left <= 0:
+            return  # Never died. Leaked for the life of the process; nothing more we can safely do.
+        QTimer.singleShot(
+            1000, lambda: self._poll_for_stale_thread_cleanup(thread, worker, attempts_left - 1)
+        )
 
     def _cleanup_thread(self) -> None:
+        self._detach_thread(delete=True)
+
+    def _detach_thread(self, delete: bool) -> None:
         self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setEnabled(True)
         self.start_button.setEnabled(True)
-        if self._worker is not None:
-            self._worker.deleteLater()
-        if self._thread is not None:
-            self._thread.deleteLater()
+        # Only delete the Qt objects once we know the thread actually stopped —
+        # deleting a QThread that is still executing is undefined behavior.
+        # If it never stopped, drop the Python references and let it leak
+        # rather than risk a crash or another hang.
+        if delete:
+            if self._worker is not None:
+                self._worker.deleteLater()
+            if self._thread is not None:
+                self._thread.deleteLater()
         self._worker = None
         self._thread = None
 
@@ -210,6 +323,10 @@ class MainWindow(QMainWindow):
     def _on_transcription_failed(self, message: str) -> None:
         self.status_label.setText("Failed.")
         QMessageBox.critical(self, "Transcription failed", message)
+
+    def _on_transcription_cancelled(self) -> None:
+        self.status_label.setText("Cancelled.")
+        self._set_export_enabled(bool(self.results_view.segments()))
 
     def _set_export_enabled(self, enabled: bool) -> None:
         self.export_txt_button.setEnabled(enabled)

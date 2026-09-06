@@ -39,6 +39,10 @@ class Segment:
     speaker: Optional[str] = None
 
 
+class TranscriptionCancelled(Exception):
+    """Raised internally when a user cancels a running transcription."""
+
+
 def find_ffmpeg() -> str:
     """Return a path to an ffmpeg binary, downloading a portable one on first use."""
     import imageio_ffmpeg
@@ -70,6 +74,16 @@ def transcribe_audio(
     on_segment: Optional[Callable[[Segment], None]] = None,
 ) -> list[Segment]:
     """Run faster-whisper on an audio file, returning timestamped segments."""
+    import os
+
+    # First run downloads model weights from Hugging Face Hub. Left
+    # unbounded, a dead or blocked connection hangs here indefinitely with
+    # no way for the app to recover -- there's no cancellation checkpoint
+    # reachable inside a third-party blocking HTTP call. Bounding it here
+    # means a bad connection fails with a catchable exception in a fixed
+    # window instead. Respects a value the user has already set.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_size, device="auto", compute_type="auto")
@@ -91,6 +105,7 @@ class TranscriptionWorker(QObject):
     segment_ready = Signal(object)
     finished = Signal(list)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(
         self,
@@ -106,19 +121,35 @@ class TranscriptionWorker(QObject):
         self.language = language
         self.diarize = diarize
         self.hf_token = hf_token
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        """Ask the pipeline to stop at its next checkpoint (cooperative, not immediate)."""
+        self._cancel_requested = True
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested:
+            raise TranscriptionCancelled()
 
     def run(self) -> None:
         try:
             self.progress.emit("Extracting audio...")
             audio_path = extract_audio(self.video_path)
+            self._check_cancelled()
 
             self.progress.emit("Transcribing...")
+
+            def on_segment(seg: Segment) -> None:
+                self.segment_ready.emit(seg)
+                self._check_cancelled()
+
             segments = transcribe_audio(
                 audio_path,
                 model_size=self.model_size,
                 language=self.language,
-                on_segment=lambda seg: self.segment_ready.emit(seg),
+                on_segment=on_segment,
             )
+            self._check_cancelled()
 
             if self.diarize:
                 self.progress.emit("Identifying speakers...")
@@ -126,8 +157,11 @@ class TranscriptionWorker(QObject):
 
                 speaker_segments = diarize_audio(audio_path, hf_token=self.hf_token)
                 segments = assign_speakers(segments, speaker_segments)
+                self._check_cancelled()
 
             self.progress.emit("Done.")
             self.finished.emit(segments)
+        except TranscriptionCancelled:
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
             self.failed.emit(str(exc))

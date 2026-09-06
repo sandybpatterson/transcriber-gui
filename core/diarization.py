@@ -9,6 +9,11 @@ from core.engine import Segment
 
 def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple[float, float, str]]:
     """Run pyannote's speaker-diarization pipeline, returning (start, end, speaker) turns."""
+    # Same reasoning as transcribe_audio's model download: bound the Hub
+    # fetch so a dead connection fails fast instead of hanging with no
+    # reachable cancellation point.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+
     from pyannote.audio import Pipeline
 
     token = hf_token or os.environ.get("HF_TOKEN")

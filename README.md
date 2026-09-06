@@ -25,7 +25,7 @@ said what.
   (`tiny` / `base` / `small` / `medium` / `large-v3-turbo`) and language
   auto-detection
 - Transcription runs on a background thread, so the UI never freezes, and
-  shows live progress
+  shows live progress, with a Cancel button to stop a run in progress
 - Scrollable, searchable, editable transcript panel with timestamps
 - Export to `.txt` (plain), `.srt` (subtitles), or `.docx` (formatted
   document)
