@@ -1,6 +1,7 @@
 """Main application window: file picker, model/language options, transcription, export."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -20,11 +22,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker
+from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.results_view import ResultsView
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi")
+AUTOSAVE_DIR = Path.home() / "Documents" / "TranscriberGUI Autosaves"
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
+    return slug[:80] or "transcript"
+
+
+def _fallback_name(video_path: str) -> str:
+    return video_path.rstrip("/").rsplit("/", 1)[-1] if is_url(video_path) else Path(video_path).stem
+
+
+def _unique_path(directory: Path, stem: str, suffix: str) -> Path:
+    """`stem.suffix`, or `stem (2).suffix` etc. if that name is already taken."""
+    candidate = directory / f"{stem}{suffix}"
+    n = 2
+    while candidate.exists():
+        candidate = directory / f"{stem} ({n}){suffix}"
+        n += 1
+    return candidate
 
 
 def _format_hms(seconds: float) -> str:
@@ -73,6 +95,7 @@ class MainWindow(QMainWindow):
         self.video_path: Optional[str] = None
         self._worker: Optional[TranscriptionWorker] = None
         self._thread: Optional[QThread] = None
+        self._autosave_path: Optional[Path] = None
 
         self._build_ui()
 
@@ -93,6 +116,17 @@ class MainWindow(QMainWindow):
         browse_row.addWidget(self.file_label, stretch=1)
         browse_row.addWidget(browse_button)
         layout.addLayout(browse_row)
+
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Or paste a video URL (YouTube, etc.):"))
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
+        self.url_input.returnPressed.connect(self._use_url)
+        url_row.addWidget(self.url_input, stretch=1)
+        use_url_button = QPushButton("Use URL")
+        use_url_button.clicked.connect(self._use_url)
+        url_row.addWidget(use_url_button)
+        layout.addLayout(url_row)
 
         options_row = QHBoxLayout()
 
@@ -166,9 +200,18 @@ class MainWindow(QMainWindow):
         if path:
             self._set_video_path(path)
 
+    def _use_url(self) -> None:
+        url = self.url_input.text().strip()
+        if not url:
+            return
+        if not is_url(url):
+            QMessageBox.warning(self, "Not a URL", "That doesn't look like a valid http(s) URL.")
+            return
+        self._set_video_path(url)
+
     def _set_video_path(self, path: str) -> None:
         self.video_path = path
-        self.file_label.setText(Path(path).name)
+        self.file_label.setText(path if is_url(path) else Path(path).name)
         self.start_button.setEnabled(True)
 
     # ------------------------------------------------------------------
@@ -188,6 +231,11 @@ class MainWindow(QMainWindow):
 
         language = LANGUAGES.get(self.language_combo.currentText())
 
+        AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+        self._autosave_path = _unique_path(
+            AUTOSAVE_DIR, _slugify(_fallback_name(self.video_path)), ".txt"
+        )
+
         self._worker = TranscriptionWorker(
             video_path=self.video_path,
             model_size=self.model_combo.currentText(),
@@ -196,40 +244,68 @@ class MainWindow(QMainWindow):
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
-
-        # A force-stopped worker's OS thread can't reliably be disconnected
-        # either (see _force_stop_if_still_running) — disconnect() blocks the
-        # same way wait() does against a thread with no cancellation point.
-        # So instead of relying on disconnecting a stale worker, every handler
-        # that touches UI state is guarded: it checks the emitting worker is
-        # still *the* current one before doing anything. A signal from an
-        # abandoned worker that fires late is then simply inert, with no
-        # blocking call required to make it so.
         worker = self._worker
         thread = self._thread
 
-        def guarded(handler):
-            def wrapper(*args):
-                if self._worker is worker:
-                    handler(*args)
-
-            return wrapper
-
+        # Every handler below is a real bound method of `self` (a QObject
+        # living on the GUI thread) rather than a wrapping closure -- that's
+        # what lets Qt's auto-connection logic detect these signals cross
+        # threads and marshal them onto the GUI thread automatically. A
+        # bare closure has no attached QObject for Qt to inspect, so it
+        # can't tell -- and silently runs the handler (and whatever widgets
+        # it touches) directly on the worker's background thread instead.
+        # That's a real crash found by running this for real: mutating
+        # QWidgets off the GUI thread eventually segfaults, consistently
+        # right after the burst of updates near the end of a transcription.
+        # Wrapping in `type=Qt.ConnectionType.QueuedConnection` does NOT
+        # fix this for a bare closure either -- confirmed directly, Qt still
+        # needs a real QObject receiver to queue against.
+        #
+        # A force-stopped worker's OS thread can't reliably be disconnected
+        # (see _force_stop_if_still_running) -- disconnect() blocks the same
+        # way wait() does against a thread with no cancellation point. So
+        # instead of relying on disconnecting a stale worker, every handler
+        # checks self.sender() against the worker/thread that's still
+        # current before doing anything -- a signal from an abandoned
+        # worker that fires late is then simply inert, no blocking call
+        # required.
         thread.started.connect(worker.run)
-        worker.progress.connect(guarded(self._on_phase_message))
-        worker.segment_progress.connect(guarded(self._on_segment_progress))
-        worker.segment_ready.connect(guarded(self.results_view.add_segment))
-        worker.finished.connect(guarded(self._on_transcription_finished))
-        worker.failed.connect(guarded(self._on_transcription_failed))
-        worker.cancelled.connect(guarded(self._on_transcription_cancelled))
+        worker.progress.connect(self._on_phase_message)
+        worker.title_resolved.connect(self._on_title_resolved)
+        worker.segment_progress.connect(self._on_segment_progress)
+        worker.segment_ready.connect(self._on_segment_ready)
+        worker.finished.connect(self._on_transcription_finished)
+        worker.failed.connect(self._on_transcription_failed)
+        worker.cancelled.connect(self._on_transcription_cancelled)
         # These three only tell the worker's own thread to quit -- harmless
         # even if stale, and bound to this specific thread regardless.
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
-        thread.finished.connect(guarded(self._cleanup_thread))
+        thread.finished.connect(self._cleanup_thread)
 
         thread.start()
+
+    def _on_title_resolved(self, title: str) -> None:
+        if self.sender() is not self._worker:
+            return
+        AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+        self._autosave_path = _unique_path(AUTOSAVE_DIR, _slugify(title), ".txt")
+
+    def _on_segment_ready(self, segment) -> None:
+        if self.sender() is not self._worker:
+            return
+        self.results_view.add_segment(segment)
+        # Re-writes the whole file each time rather than appending a line --
+        # simpler and reuses export_txt as-is, and transcripts are small
+        # enough that this stays cheap. Never let a write failure (e.g. a
+        # full disk) take down the transcription itself.
+        if self._autosave_path is None:
+            return
+        try:
+            export_txt(self.results_view.segments(), str(self._autosave_path))
+        except OSError:
+            pass
 
     def _cancel_transcription(self) -> None:
         if self._worker is None or self._thread is None:
@@ -283,6 +359,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             "Cancelled — the background task could not be confirmed stopped "
             "and may still be finishing silently. Safe to start another one."
+            f"{self._autosave_note()}"
         )
         self._set_export_enabled(bool(self.results_view.segments()))
         self._detach_thread(delete=False)
@@ -304,6 +381,8 @@ class MainWindow(QMainWindow):
         )
 
     def _cleanup_thread(self) -> None:
+        if self.sender() is not self._thread:
+            return
         self._detach_thread(delete=True)
 
     def _detach_thread(self, delete: bool) -> None:
@@ -324,6 +403,8 @@ class MainWindow(QMainWindow):
         self._thread = None
 
     def _on_phase_message(self, message: str) -> None:
+        if self.sender() is not self._worker:
+            return
         # Reset to indeterminate for phases with no known progress (extraction,
         # diarization) -- _on_segment_progress switches it to determinate once
         # transcription starts reporting real percentages.
@@ -331,6 +412,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _on_segment_progress(self, percent: int, seconds_done: float, total_seconds: float) -> None:
+        if self.sender() is not self._worker:
+            return
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(percent)
         self.status_label.setText(
@@ -339,17 +422,29 @@ class MainWindow(QMainWindow):
         )
 
     def _on_transcription_finished(self, segments) -> None:
+        if self.sender() is not self._worker:
+            return
         self.results_view.set_segments(segments)
         self.status_label.setText(f"Done — {len(segments)} segments.")
         self._set_export_enabled(bool(segments))
 
     def _on_transcription_failed(self, message: str) -> None:
+        if self.sender() is not self._worker:
+            return
         self.status_label.setText("Failed.")
-        QMessageBox.critical(self, "Transcription failed", message)
+        note = self._autosave_note()
+        QMessageBox.critical(self, "Transcription failed", f"{message}{note}")
 
     def _on_transcription_cancelled(self) -> None:
-        self.status_label.setText("Cancelled.")
+        if self.sender() is not self._worker:
+            return
+        self.status_label.setText(f"Cancelled.{self._autosave_note()}")
         self._set_export_enabled(bool(self.results_view.segments()))
+
+    def _autosave_note(self) -> str:
+        if self._autosave_path is not None and self.results_view.segments():
+            return f"\n\nWhatever was transcribed so far was auto-saved to:\n{self._autosave_path}"
+        return ""
 
     def _set_export_enabled(self, enabled: bool) -> None:
         self.export_txt_button.setEnabled(enabled)

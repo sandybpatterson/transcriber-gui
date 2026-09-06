@@ -6,11 +6,14 @@ plain function usable and testable on its own.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, Signal
 
@@ -53,6 +56,58 @@ def find_ffmpeg() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
+def is_url(path: str) -> bool:
+    """True if `path` looks like a URL (YouTube, etc.) rather than a local file."""
+    return urlparse(path).scheme in ("http", "https")
+
+
+def download_audio(
+    url: str,
+    output_dir: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+    check_cancelled: Optional[Callable[[], None]] = None,
+    on_title: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Fetch only the audio-only stream from a URL (YouTube, etc.) as a WAV file.
+
+    Never downloads the video track: yt-dlp picks an audio-only format when
+    one is offered (true for virtually all YouTube videos), so this is a
+    small, fast fetch compared to grabbing the full video.
+    """
+    import yt_dlp
+
+    def hook(d: dict) -> None:
+        if check_cancelled:
+            check_cancelled()
+        if on_progress and d.get("status") == "downloading":
+            pct = d.get("_percent_str", "").strip()
+            on_progress(f"Downloading audio...{(' ' + pct) if pct else ''}")
+
+    # No FFmpegExtractAudio postprocessor here: yt-dlp's postprocessor also
+    # shells out to ffprobe (to inspect the downloaded codec first), which
+    # imageio-ffmpeg doesn't bundle -- it only provides ffmpeg. Downloading
+    # the raw audio-only stream as-is and converting it with our own
+    # extract_audio() (ffmpeg only, already used for local video files)
+    # sidesteps that dependency entirely.
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(Path(output_dir) / "%(id)s.%(ext)s"),
+        "ffmpeg_location": str(Path(find_ffmpeg()).parent),
+        "progress_hooks": [hook],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        downloaded_path = Path(ydl.prepare_filename(info))
+    if on_title:
+        on_title(info.get("title") or info.get("id") or downloaded_path.stem)
+    if not downloaded_path.exists():
+        raise RuntimeError(f"Expected downloaded audio at {downloaded_path}, but it wasn't created.")
+    return extract_audio(str(downloaded_path), output_dir=output_dir)
+
+
 def extract_audio(video_path: str, output_dir: Optional[str] = None) -> str:
     """Extract a mono 16kHz WAV audio track from a video file via ffmpeg."""
     video = Path(video_path)
@@ -86,8 +141,6 @@ def transcribe_audio(
     on_segment: Optional[Callable[[Segment], None]] = None,
 ) -> list[Segment]:
     """Run faster-whisper on an audio file, returning timestamped segments."""
-    import os
-
     # First run downloads model weights from Hugging Face Hub. Left
     # unbounded, a dead or blocked connection hangs here indefinitely with
     # no way for the app to recover -- there's no cancellation checkpoint
@@ -114,6 +167,7 @@ class TranscriptionWorker(QObject):
     """Runs extract -> transcribe -> (optional) diarize on a background thread."""
 
     progress = Signal(str)
+    title_resolved = Signal(str)
     segment_progress = Signal(int, float, float)  # percent, seconds done, total seconds
     segment_ready = Signal(object)
     finished = Signal(list)
@@ -145,9 +199,27 @@ class TranscriptionWorker(QObject):
             raise TranscriptionCancelled()
 
     def run(self) -> None:
+        download_dir: Optional[tempfile.TemporaryDirectory] = None
+        extracted_audio_path: Optional[str] = None
         try:
-            self.progress.emit("Extracting audio...")
-            audio_path = extract_audio(self.video_path)
+            if is_url(self.video_path):
+                self.progress.emit("Downloading audio...")
+                download_dir = tempfile.TemporaryDirectory(prefix="transcribergui_")
+                audio_path = download_audio(
+                    self.video_path,
+                    output_dir=download_dir.name,
+                    on_progress=self.progress.emit,
+                    check_cancelled=self._check_cancelled,
+                    on_title=self.title_resolved.emit,
+                )
+            else:
+                self.title_resolved.emit(Path(self.video_path).stem)
+                self.progress.emit("Extracting audio...")
+                audio_path = extract_audio(self.video_path)
+                # This WAV is a byproduct with no further use once transcribed --
+                # clean it up rather than leaving it next to the source video
+                # forever (matters at the volume of a batch of podcast episodes).
+                extracted_audio_path = audio_path
             self._check_cancelled()
 
             self.progress.emit("Transcribing...")
@@ -182,3 +254,11 @@ class TranscriptionWorker(QObject):
             self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
             self.failed.emit(str(exc))
+        finally:
+            if download_dir is not None:
+                download_dir.cleanup()
+            if extracted_audio_path is not None:
+                try:
+                    os.remove(extracted_audio_path)
+                except OSError:
+                    pass

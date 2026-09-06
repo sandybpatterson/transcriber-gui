@@ -6,3 +6,6 @@ python-docx
 # Provides a portable ffmpeg binary, auto-downloaded on first use, so users
 # never need ffmpeg on their own PATH.
 imageio-ffmpeg
+# Fetches audio-only (no video) directly from YouTube and other supported
+# sites, for transcribing without a manual download step.
+yt-dlp
