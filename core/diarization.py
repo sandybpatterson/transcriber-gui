@@ -25,7 +25,21 @@ def check_hf_token(token: str) -> None:
     link to it on success partial failure; returns normally if both are
     reachable.
     """
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download
+
+    # HF's gated-repo error text ("...must be authenticated... please log
+    # in") reads the same whether the token itself is wrong or the token
+    # is fine but just hasn't been granted access to that specific repo --
+    # checked separately here so the message can actually tell those apart
+    # instead of leaving it ambiguous.
+    try:
+        HfApi().whoami(token=token)
+    except Exception as exc:  # noqa: BLE001 - surface Hugging Face's own reason
+        raise RuntimeError(
+            f"That token itself isn't valid: {exc}\n\n"
+            "Double-check it was copied in full with no missing characters, "
+            "or create a new one at https://huggingface.co/settings/tokens."
+        ) from exc
 
     for repo_id in REQUIRED_REPOS:
         try:
