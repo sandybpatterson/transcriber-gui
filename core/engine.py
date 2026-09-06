@@ -7,11 +7,14 @@ plain function usable and testable on its own.
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Signal
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
@@ -61,7 +64,7 @@ def extract_audio(video_path: str, output_dir: Optional[str] = None) -> str:
         "-vn", "-ac", "1", "-ar", "16000",
         "-f", "wav", str(audio_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed to extract audio:\n{result.stderr}")
     return str(audio_path)
