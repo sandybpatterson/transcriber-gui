@@ -55,7 +55,7 @@ def check_hf_token(token: str) -> None:
         try:
             hf_hub_download(repo_id, "config.yaml", token=token)
         except Exception as exc:  # noqa: BLE001 - surface whatever Hugging Face actually said
-            logger.warning("No access to %s: %s", repo_id, exc)
+            logger.exception("Failed downloading config.yaml from %s", repo_id)
             raise RuntimeError(
                 f"Can't access {repo_id} yet: {exc}\n\n"
                 f"Visit https://huggingface.co/{repo_id} while logged in and "
