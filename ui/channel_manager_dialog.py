@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QSettings, QThread
+from PySide6.QtCore import Qt, QSettings, QThread, Signal
 from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDialog,
@@ -34,6 +34,13 @@ class ChannelManagerDialog(QDialog):
     holding a persistent reference rather than recreating it each time --
     closing this window only hides it, so a background check in progress
     can keep safely delivering signals to it either way."""
+
+    # Emitted with a video's URL when the user picks one to manually
+    # re-run from the video browser -- MainWindow handles actually running
+    # it, through the exact same single-video pipeline (progress bar,
+    # results table, autosave, speaker rename, export) a pasted URL gets,
+    # rather than this dialog running a second parallel copy of it.
+    video_rerun_requested = Signal(str)
 
     def __init__(
         self,
@@ -68,6 +75,22 @@ class ChannelManagerDialog(QDialog):
         self._language = language
         self._diarize = diarize
         self._hf_token = hf_token
+
+    def closeEvent(self, event) -> None:
+        # Closing this window previously left an active channel check
+        # running invisibly in the background -- confirmed, there was no
+        # override here at all before this. terminate() immediately
+        # rather than the graceful "cooperative cancel, then force-stop
+        # after a delay" dance used for the visible Cancel button: the
+        # user closing the window wants everything stopped now, and a
+        # delayed QTimer might not even get a chance to fire once the
+        # window (and possibly the whole app, if this was the last one)
+        # is gone.
+        if self._thread is not None and self._thread.isRunning():
+            if self._worker is not None:
+                self._worker.request_cancel()
+            self._thread.terminate()
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -168,7 +191,13 @@ class ChannelManagerDialog(QDialog):
         name = list_channels().get(url, {}).get("name", url)
         dialog = ChannelVideosDialog(self, url, name)
         if dialog.exec() and dialog.selected_video is not None:
-            self._start_check(explicit_queue=[(url, name, dialog.selected_video)])
+            # Re-running a video hands off to the main window's own
+            # single-video pipeline (same progress bar, results table,
+            # autosave, everything a pasted URL gets) rather than running
+            # a second parallel copy of it in here -- so this whole
+            # window's job is done once a video is picked.
+            self.video_rerun_requested.emit(dialog.selected_video["url"])
+            self.close()
 
     def _add_channel(self) -> None:
         url, ok = QInputDialog.getText(
@@ -203,7 +232,7 @@ class ChannelManagerDialog(QDialog):
     # ------------------------------------------------------------------
     # Checking / processing
     # ------------------------------------------------------------------
-    def _start_check(self, explicit_queue: Optional[list[tuple[str, str, dict]]] = None) -> None:
+    def _start_check(self) -> None:
         self.check_button.setEnabled(False)
         self.cancel_button.setVisible(True)
         self.log_view.clear()
@@ -217,7 +246,6 @@ class ChannelManagerDialog(QDialog):
             language=self._language,
             diarize=self._diarize,
             hf_token=self._hf_token,
-            explicit_queue=explicit_queue,
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)

@@ -108,6 +108,27 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
+    def closeEvent(self, event) -> None:
+        # Confirmed: with no override here, closing the window while a
+        # transcription was running left the background thread executing
+        # invisibly -- the process doesn't stop just because its window
+        # did. terminate() immediately rather than the graceful
+        # "cooperative cancel, then force-stop after a delay" dance used
+        # for the visible Cancel button: the user closing the window
+        # wants everything stopped now, and a delayed QTimer might not
+        # even get a chance to fire once the last window (and, by Qt's
+        # default quitOnLastWindowClose, the whole app) is gone.
+        if self._thread is not None and self._thread.isRunning():
+            if self._worker is not None:
+                self._worker.request_cancel()
+            self._thread.terminate()
+        # The channel watcher window is independent and may have its own
+        # job running -- closing it here triggers its own closeEvent,
+        # which stops that the same way.
+        if self._channel_dialog is not None:
+            self._channel_dialog.close()
+        super().closeEvent(event)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -294,6 +315,7 @@ class MainWindow(QMainWindow):
             self._channel_dialog = ChannelManagerDialog(
                 self, self.model_combo.currentData(), language, diarize, hf_token
             )
+            self._channel_dialog.video_rerun_requested.connect(self._rerun_video_from_channel)
         else:
             self._channel_dialog.update_transcription_settings(
                 self.model_combo.currentData(), language, diarize, hf_token
@@ -305,8 +327,25 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Transcription
     # ------------------------------------------------------------------
+    def _rerun_video_from_channel(self, url: str) -> None:
+        """Handles "Re-run" from the channel video browser: loads the URL
+        into the main window exactly as if it had been pasted, and runs it
+        through this window's own pipeline rather than a second parallel
+        one -- same progress bar, results table, autosave, everything."""
+        self.raise_()
+        self.activateWindow()
+        self.url_input.setText(url)
+        self._use_url()
+        self._start_transcription()
+
     def _start_transcription(self) -> None:
         if not self.video_path:
+            return
+        if self._worker is not None:
+            QMessageBox.warning(
+                self, "Already running",
+                "A transcription is already in progress. Wait for it to finish, or cancel it, first.",
+            )
             return
 
         self.results_view.clear()

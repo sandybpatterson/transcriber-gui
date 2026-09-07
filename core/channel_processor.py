@@ -51,7 +51,6 @@ class ChannelCheckWorker(QObject):
         language: Optional[str] = None,
         diarize: bool = False,
         hf_token: Optional[str] = None,
-        explicit_queue: Optional[list[tuple[str, str, dict]]] = None,
     ):
         super().__init__()
         self.output_dir = output_dir
@@ -59,12 +58,6 @@ class ChannelCheckWorker(QObject):
         self.language = language
         self.diarize = diarize
         self.hf_token = hf_token
-        # (channel_url, channel_name, video) tuples to process directly,
-        # bypassing the "find new videos" scan -- used to manually re-run
-        # a specific already-seen video (e.g. one from a channel's
-        # baseline right after adding it) rather than only ever picking
-        # up genuinely new ones.
-        self._explicit_queue = explicit_queue
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -83,12 +76,9 @@ class ChannelCheckWorker(QObject):
                     "Add one in the main window and try again."
                 )
 
-            if self._explicit_queue is not None:
-                queue = list(self._explicit_queue)
-            else:
-                queue = self._find_new_videos_queue()
-                if queue is None:  # already reported via self.finished
-                    return
+            queue = self._find_new_videos_queue()
+            if queue is None:  # already reported via self.finished
+                return
 
             Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             processed = 0
