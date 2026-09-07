@@ -156,6 +156,37 @@ class BackgroundCheckWorker(QObject):
             self.succeeded.emit()
 
 
+def _load_wav_as_tensor(path: str) -> dict:
+    """Reads a 16-bit PCM WAV file into pyannote's documented in-memory
+    audio format: {"waveform": (channel, time) tensor, "sample_rate": int}.
+
+    Stdlib `wave` only understands PCM, which is exactly what
+    extract_audio()/download_audio() always produce, so no general-purpose
+    decoding is needed here.
+    """
+    import wave
+
+    import numpy as np
+    import torch
+
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        sample_width = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+
+    if sample_width != 2:
+        raise RuntimeError(f"Expected 16-bit PCM WAV audio, got {sample_width * 8}-bit")
+
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).T
+    else:
+        samples = samples.reshape(1, -1)
+
+    return {"waveform": torch.from_numpy(samples), "sample_rate": sample_rate}
+
+
 def diarize_audio(
     audio_path: str,
     hf_token: Optional[str] = None,
@@ -185,7 +216,20 @@ def diarize_audio(
     logger.info("Running diarization on %s", audio_path)
     if on_progress:
         on_progress("Identifying speakers (analyzing audio)...")
-    diarization = pipeline(audio_path)
+    # Not passing audio_path directly: pyannote.audio now decodes audio via
+    # torchcodec exclusively (its own io.py: "relies on torchcodec for
+    # reading", no other backend), which itself needs real FFmpeg *shared
+    # library* DLLs on the system -- the standalone ffmpeg.exe this app
+    # bundles via imageio-ffmpeg doesn't provide those, so torchcodec's
+    # native loader fails outright. Confirmed live. Loading the WAV
+    # ourselves (already a clean 16kHz mono PCM file from extract_audio())
+    # and passing pyannote's documented in-memory alternative -- a
+    # {"waveform", "sample_rate"} dict -- sidesteps torchcodec entirely.
+    output = pipeline(_load_wav_as_tensor(audio_path))
+    # This version's pipeline returns a DiarizeOutput wrapper (also
+    # carrying exclusive_speaker_diarization and speaker_embeddings) --
+    # .speaker_diarization is the actual Annotation with .itertracks().
+    diarization = output.speaker_diarization
 
     return [
         (turn.start, turn.end, speaker)
