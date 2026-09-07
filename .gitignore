@@ -17,6 +17,10 @@ dist/
 models/
 *.wav
 
+# Stray transcript output (ends up in the repo root if run from here
+# instead of via the desktop shortcut's working directory)
+/*.txt
+
 # OS
 .DS_Store
 Thumbs.db
