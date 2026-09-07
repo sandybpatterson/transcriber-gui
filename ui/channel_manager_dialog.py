@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
 from core.channel_processor import ChannelCheckWorker
@@ -71,6 +72,14 @@ class ChannelManagerDialog(QDialog):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
 
+        # --- management view: channel list, add/remove, output folder --
+        # hidden while a check/re-run is actively in progress, so the
+        # progress view below isn't competing for attention with controls
+        # that don't apply mid-run.
+        self.management_panel = QWidget()
+        management_layout = QVBoxLayout(self.management_panel)
+        management_layout.setContentsMargins(0, 0, 0, 0)
+
         intro = QLabel(
             "Adding a channel records its current videos as a baseline -- only "
             "videos published after that point will ever be transcribed "
@@ -79,11 +88,11 @@ class ChannelManagerDialog(QDialog):
             "which videos it's tracking, and optionally re-run one of them."
         )
         intro.setWordWrap(True)
-        layout.addWidget(intro)
+        management_layout.addWidget(intro)
 
         self.channel_list = QListWidget()
         self.channel_list.itemDoubleClicked.connect(self._open_channel_videos)
-        layout.addWidget(self.channel_list, stretch=1)
+        management_layout.addWidget(self.channel_list, stretch=1)
 
         channel_row = QHBoxLayout()
         add_button = QPushButton("Add channel...")
@@ -92,7 +101,7 @@ class ChannelManagerDialog(QDialog):
         remove_button.clicked.connect(self._remove_channel)
         channel_row.addWidget(add_button)
         channel_row.addWidget(remove_button)
-        layout.addLayout(channel_row)
+        management_layout.addLayout(channel_row)
 
         output_row = QHBoxLayout()
         output_row.addWidget(QLabel("Save transcripts to:"))
@@ -102,7 +111,9 @@ class ChannelManagerDialog(QDialog):
         browse_button = QPushButton("Browse...")
         browse_button.clicked.connect(self._browse_output_dir)
         output_row.addWidget(browse_button)
-        layout.addLayout(output_row)
+        management_layout.addLayout(output_row)
+
+        layout.addWidget(self.management_panel)
 
         action_row = QHBoxLayout()
         self.check_button = QPushButton("Check for new episodes now")
@@ -116,6 +127,14 @@ class ChannelManagerDialog(QDialog):
         action_row.addWidget(self.check_button)
         action_row.addWidget(self.cancel_button)
         layout.addLayout(action_row)
+
+        # --- progress view: takes over as the dialog's main focus while
+        # something is actually running ---
+        self.progress_status_label = QLabel("")
+        self.progress_status_label.setStyleSheet("font-weight: bold; font-size: 13pt;")
+        self.progress_status_label.setWordWrap(True)
+        self.progress_status_label.setVisible(False)
+        layout.addWidget(self.progress_status_label)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -188,6 +207,9 @@ class ChannelManagerDialog(QDialog):
         self.check_button.setEnabled(False)
         self.cancel_button.setVisible(True)
         self.log_view.clear()
+        self.management_panel.setVisible(False)
+        self.progress_status_label.setVisible(True)
+        self.progress_status_label.setText("Starting...")
 
         self._worker = ChannelCheckWorker(
             output_dir=self._output_dir_str(),
@@ -228,10 +250,15 @@ class ChannelManagerDialog(QDialog):
 
     def _on_log(self, message: str) -> None:
         self.log_view.append(message)
+        # The status label mirrors whatever the log's latest line is --
+        # that's the one thing worth being big and hard to miss while
+        # this is running; the full log stays available below for detail.
+        self.progress_status_label.setText(message.strip())
 
     def _on_finished(self, count: int) -> None:
         if self.sender() is not self._worker:
             return
+        self.progress_status_label.setText(f"Done. {count} video(s) transcribed.")
         self._reload_channel_list()
 
     def _on_failed(self, message: str) -> None:
@@ -251,6 +278,7 @@ class ChannelManagerDialog(QDialog):
         self.check_button.setEnabled(True)
         self.cancel_button.setVisible(False)
         self.cancel_button.setEnabled(True)
+        self.management_panel.setVisible(True)
         if self._worker is not None:
             self._worker.deleteLater()
         if self._thread is not None:
