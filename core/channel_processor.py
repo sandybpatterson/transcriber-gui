@@ -148,6 +148,7 @@ class ChannelCheckWorker(QObject):
                 audio_path,
                 model_size=self.model_size,
                 language=self.language,
+                on_progress=self.log.emit,
             )
             self._check_cancelled()
 

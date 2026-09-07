@@ -103,6 +103,11 @@ class MainWindow(QMainWindow):
         self._worker: Optional[TranscriptionWorker] = None
         self._thread: Optional[QThread] = None
         self._autosave_path: Optional[Path] = None
+        # The video's real resolved title (from title_resolved), used for
+        # the manual Export buttons' suggested filename -- without this,
+        # a URL source fell back to Path(url).stem, producing garbage
+        # like "watch?v=xyz" instead of the actual episode title.
+        self._current_title: Optional[str] = None
         self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
         self._channel_dialog: Optional[ChannelManagerDialog] = None
 
@@ -428,6 +433,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.status_label.setText("Starting...")
+        self._current_title = None
 
         language = LANGUAGES.get(self.language_combo.currentText())
 
@@ -490,6 +496,7 @@ class MainWindow(QMainWindow):
     def _on_title_resolved(self, title: str) -> None:
         if self.sender() is not self._worker:
             return
+        self._current_title = title
         AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
         self._autosave_path = _unique_path(AUTOSAVE_DIR, _slugify(title), ".txt")
 
@@ -721,6 +728,14 @@ class MainWindow(QMainWindow):
     # Export
     # ------------------------------------------------------------------
     def _default_export_path(self, suffix: str) -> str:
+        # A URL source has no meaningful parent directory to default to,
+        # and Path(url).stem produces garbage like "watch?v=xyz" -- not
+        # the actual episode title. Use the real resolved title once
+        # known, saving into Documents, matching what autosave already
+        # does correctly for the same case.
+        if self.video_path and is_url(self.video_path):
+            stem = _slugify(self._current_title or _fallback_name(self.video_path))
+            return str(Path.home() / "Documents" / f"{stem}{suffix}")
         stem = Path(self.video_path).stem if self.video_path else "transcript"
         return str(Path(self.video_path or ".").parent / f"{stem}{suffix}")
 

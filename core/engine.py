@@ -158,11 +158,26 @@ def _wav_duration_seconds(path: str) -> float:
         return wf.getnframes() / float(rate) if rate else 0.0
 
 
+class _LogForwardingHandler(logging.Handler):
+    """Forwards a logger's records to an on_progress callback, so an
+    otherwise-silent internal library step shows up as visible status
+    text instead of a dead gap in the UI."""
+
+    def __init__(self, on_progress: Callable[[str], None], prefix: str):
+        super().__init__()
+        self._on_progress = on_progress
+        self._prefix = prefix
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._on_progress(f"{self._prefix} ({self.format(record)})")
+
+
 def transcribe_audio(
     audio_path: str,
     model_size: str = "base",
     language: Optional[str] = None,
     on_segment: Optional[Callable[[Segment], None]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> list[Segment]:
     """Run faster-whisper on an audio file, returning timestamped segments."""
     # First run downloads model weights from Hugging Face Hub. Left
@@ -173,18 +188,55 @@ def transcribe_audio(
     # window instead. Respects a value the user has already set.
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
+    if on_progress:
+        on_progress("Transcribing... (loading model)")
+
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_size, device="auto", compute_type="auto")
-    raw_segments, _info = model.transcribe(audio_path, language=language, vad_filter=True)
 
-    segments: list[Segment] = []
-    for raw in raw_segments:
-        segment = Segment(start=raw.start, end=raw.end, text=raw.text.strip())
-        segments.append(segment)
-        if on_segment:
-            on_segment(segment)
-    return segments
+    # model.transcribe() returns a lazy generator: loading the model
+    # weights, running voice-activity detection over the *entire* file,
+    # and detecting the spoken language all happen up front, the moment
+    # iteration starts below -- before the very first transcript line is
+    # available. For a long episode with no feedback during that stretch,
+    # this reads as a hang: confirmed live, a user watching it couldn't
+    # tell it apart from one. faster_whisper already logs each of those
+    # steps ("Processing audio with duration...", "VAD filter removed...",
+    # "Detected language...") -- forwarding them to on_progress surfaces
+    # real, specific movement instead of a static "Transcribing..." the
+    # whole time.
+    fw_logger = logging.getLogger("faster_whisper")
+    handler: Optional[_LogForwardingHandler] = None
+    previous_level = fw_logger.level
+    if on_progress:
+        on_progress("Transcribing... (analyzing audio)")
+        handler = _LogForwardingHandler(on_progress, "Transcribing...")
+        fw_logger.addHandler(handler)
+        # A handler attached directly to this logger still only receives
+        # what the logger's own *effective* level lets through -- which,
+        # with no level of its own (the default), is inherited from its
+        # nearest ancestor. Confirmed directly: standalone, with no other
+        # logging configured, that resolves to root's default WARNING,
+        # silently dropping these INFO messages before they ever reach
+        # this handler. Setting it explicitly makes this work regardless
+        # of whatever the app's global logging setup happens to be.
+        fw_logger.setLevel(logging.INFO)
+
+    try:
+        raw_segments, _info = model.transcribe(audio_path, language=language, vad_filter=True)
+
+        segments: list[Segment] = []
+        for raw in raw_segments:
+            segment = Segment(start=raw.start, end=raw.end, text=raw.text.strip())
+            segments.append(segment)
+            if on_segment:
+                on_segment(segment)
+        return segments
+    finally:
+        if handler is not None:
+            fw_logger.removeHandler(handler)
+            fw_logger.setLevel(previous_level)
 
 
 class TranscriptionWorker(QObject):
@@ -265,6 +317,7 @@ class TranscriptionWorker(QObject):
                 model_size=self.model_size,
                 language=self.language,
                 on_segment=on_segment,
+                on_progress=self.progress.emit,
             )
             self._check_cancelled()
             logger.info("Transcription produced %d segment(s)", len(segments))
