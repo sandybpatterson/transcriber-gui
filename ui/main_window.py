@@ -22,10 +22,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.diarization import REQUIRED_REPOS, HfTokenTestWorker
+from core.diarization import verification_key
 from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.channel_manager_dialog import ChannelManagerDialog
+from ui.diarization_setup_wizard import DiarizationSetupWizard
 from ui.results_view import ResultsView
 from ui.speaker_rename_dialog import SpeakerRenameDialog
 
@@ -104,11 +105,8 @@ class MainWindow(QMainWindow):
         self._autosave_path: Optional[Path] = None
         self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
         self._channel_dialog: Optional[ChannelManagerDialog] = None
-        self._token_test_thread: Optional[QThread] = None
-        self._token_test_worker: Optional[HfTokenTestWorker] = None
 
         self._build_ui()
-        self.hf_token_input.setText(self._settings.value("hf_token", "", type=str))
 
     # ------------------------------------------------------------------
     # UI construction
@@ -169,55 +167,28 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.diarize_checkbox)
 
         self.diarize_panel = QWidget()
-        diarize_layout = QVBoxLayout(self.diarize_panel)
+        diarize_layout = QHBoxLayout(self.diarize_panel)
         diarize_layout.setContentsMargins(20, 0, 0, 8)
 
-        # --- setup state: shown until the pasted token is actually verified ---
+        # --- setup state: shown until the token is verified against every
+        # required repo -- opens the step-by-step wizard rather than an
+        # inline wall of instructions ---
         self.diarize_setup_widget = QWidget()
-        setup_layout = QVBoxLayout(self.diarize_setup_widget)
+        setup_layout = QHBoxLayout(self.diarize_setup_widget)
         setup_layout.setContentsMargins(0, 0, 0, 0)
-        repo_links = "".join(
-            f"&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/{repo}\">{repo}</a><br>"
-            for repo in REQUIRED_REPOS
-        )
-        setup_info = QLabel(
-            "Needs a free Hugging Face token (one-time setup):<br>"
-            "1. Create a free account: <a href=\"https://huggingface.co/join\">huggingface.co/join</a><br>"
-            f"2. While logged in, open these model pages (all gated) and "
-            f"request/accept access if prompted:<br>{repo_links}"
-            "3. Create a token (\"Read\" access is enough): "
-            "<a href=\"https://huggingface.co/settings/tokens\">huggingface.co/settings/tokens</a><br>"
-            "4. Paste it below and click \"Test &amp; Save\"."
-        )
-        setup_info.setOpenExternalLinks(True)
-        setup_info.setWordWrap(True)
-        setup_layout.addWidget(setup_info)
-
-        token_row = QHBoxLayout()
-        token_row.addWidget(QLabel("Hugging Face token:"))
-        self.hf_token_input = QLineEdit()
-        self.hf_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.hf_token_input.setPlaceholderText("hf_...")
-        token_row.addWidget(self.hf_token_input, stretch=1)
-        self.hf_token_test_button = QPushButton("Test && Save")
-        self.hf_token_test_button.clicked.connect(self._test_hf_token)
-        token_row.addWidget(self.hf_token_test_button)
-        setup_layout.addLayout(token_row)
-
-        self.hf_token_status_label = QLabel("")
-        self.hf_token_status_label.setWordWrap(True)
-        self.hf_token_status_label.setOpenExternalLinks(True)
-        setup_layout.addWidget(self.hf_token_status_label)
-
+        setup_button = QPushButton("Set up speaker identification...")
+        setup_button.clicked.connect(self._open_diarization_setup)
+        setup_layout.addWidget(setup_button)
+        setup_layout.addStretch(1)
         diarize_layout.addWidget(self.diarize_setup_widget)
 
-        # --- verified state: collapses the above once the token actually works ---
+        # --- verified state: shown once every required repo is confirmed ---
         self.diarize_verified_widget = QWidget()
         verified_layout = QHBoxLayout(self.diarize_verified_widget)
         verified_layout.setContentsMargins(0, 0, 0, 0)
-        verified_layout.addWidget(QLabel("Hugging Face token verified."))
+        verified_layout.addWidget(QLabel("Speaker identification ready."))
         change_token_button = QPushButton("Change...")
-        change_token_button.clicked.connect(self._edit_hf_token)
+        change_token_button.clicked.connect(self._open_diarization_setup)
         verified_layout.addWidget(change_token_button)
         verified_layout.addStretch(1)
         diarize_layout.addWidget(self.diarize_verified_widget)
@@ -290,96 +261,34 @@ class MainWindow(QMainWindow):
         self.file_label.setText(path if is_url(path) else Path(path).name)
         self.start_button.setEnabled(True)
 
-    def _save_hf_token(self) -> None:
-        self._settings.setValue("hf_token", self.hf_token_input.text().strip())
+    def _get_hf_token(self) -> str:
+        return self._settings.value("hf_token", "", type=str)
 
     def _on_diarize_toggled(self, checked: bool) -> None:
         self.diarize_panel.setVisible(checked)
         if checked:
             self._refresh_diarize_setup_state()
 
-    @staticmethod
-    def _verification_key(token: str) -> str:
-        # Ties "verified" to both the token AND the current set of
-        # required repos -- so adding a newly-discovered gated dependency
-        # (this has happened more than once) automatically invalidates a
-        # prior verification instead of leaving a stale "verified" state
-        # for a check that covered fewer repos than are now needed.
-        return token + "::" + ",".join(REQUIRED_REPOS)
-
     def _refresh_diarize_setup_state(self) -> None:
         # "Verified" means this exact token already passed a real access
-        # check against the current required-repos list -- editing the
-        # field, or the app adding a newly-discovered repo, falls back to
-        # setup state since that hasn't been (re)tested yet.
-        token = self.hf_token_input.text().strip()
+        # check against the current required-repos list -- the app adding
+        # a newly-discovered repo falls back to setup state automatically,
+        # since that hasn't been (re)tested yet.
+        token = self._get_hf_token()
         verified_key = self._settings.value("hf_token_verified_key", "", type=str)
-        is_verified = bool(token) and self._verification_key(token) == verified_key
+        is_verified = bool(token) and verification_key(token) == verified_key
         self.diarize_setup_widget.setVisible(not is_verified)
         self.diarize_verified_widget.setVisible(is_verified)
 
-    def _edit_hf_token(self) -> None:
-        self.hf_token_status_label.setText("")
-        self.diarize_setup_widget.setVisible(True)
-        self.diarize_verified_widget.setVisible(False)
-
-    def _test_hf_token(self) -> None:
-        token = self.hf_token_input.text().strip()
-        if not token:
-            self.hf_token_status_label.setText("Paste a token first.")
-            return
-
-        self.hf_token_test_button.setEnabled(False)
-        self.hf_token_status_label.setText(f"Checking access to all {len(REQUIRED_REPOS)} required models...")
-
-        self._token_test_worker = HfTokenTestWorker(token)
-        self._token_test_thread = QThread()
-        self._token_test_worker.moveToThread(self._token_test_thread)
-        worker = self._token_test_worker
-        thread = self._token_test_thread
-
-        # Real bound methods + self.sender() guards -- see the note in
-        # _start_transcription for why a closure-wrapped connection here
-        # would silently run the handler on the wrong thread instead.
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self._on_token_test_succeeded)
-        worker.failed.connect(self._on_token_test_failed)
-        worker.succeeded.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._cleanup_token_test_thread)
-
-        thread.start()
-
-    def _on_token_test_succeeded(self) -> None:
-        if self.sender() is not self._token_test_worker:
-            return
-        token = self.hf_token_input.text().strip()
-        self._settings.setValue("hf_token", token)
-        self._settings.setValue("hf_token_verified_key", self._verification_key(token))
-        self.hf_token_status_label.setText("")
-        self._refresh_diarize_setup_state()
-
-    def _on_token_test_failed(self, message: str) -> None:
-        if self.sender() is not self._token_test_worker:
-            return
-        self.hf_token_status_label.setText(message)
-
-    def _cleanup_token_test_thread(self) -> None:
-        if self.sender() is not self._token_test_thread:
-            return
-        self.hf_token_test_button.setEnabled(True)
-        if self._token_test_worker is not None:
-            self._token_test_worker.deleteLater()
-        if self._token_test_thread is not None:
-            self._token_test_thread.deleteLater()
-        self._token_test_worker = None
-        self._token_test_thread = None
+    def _open_diarization_setup(self) -> None:
+        wizard = DiarizationSetupWizard(self, existing_token=self._get_hf_token())
+        wizard.setup_completed.connect(lambda _token: self._refresh_diarize_setup_state())
+        wizard.exec()
 
     def _open_channel_manager(self) -> None:
-        self._save_hf_token()
         language = LANGUAGES.get(self.language_combo.currentText())
         diarize = self.diarize_checkbox.isChecked()
-        hf_token = self.hf_token_input.text().strip() or None
+        hf_token = self._get_hf_token() or None
         if self._channel_dialog is None:
             self._channel_dialog = ChannelManagerDialog(
                 self, self.model_combo.currentText(), language, diarize, hf_token
@@ -414,13 +323,12 @@ class MainWindow(QMainWindow):
             AUTOSAVE_DIR, _slugify(_fallback_name(self.video_path)), ".txt"
         )
 
-        self._save_hf_token()
         self._worker = TranscriptionWorker(
             video_path=self.video_path,
             model_size=self.model_combo.currentText(),
             language=language,
             diarize=self.diarize_checkbox.isChecked(),
-            hf_token=self.hf_token_input.text().strip() or None,
+            hf_token=self._get_hf_token() or None,
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
