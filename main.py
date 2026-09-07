@@ -20,15 +20,22 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+from pathlib import Path
+
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from core.app_logging import setup_logging
 from ui.main_window import MainWindow
 
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.ico"
+
 
 def main() -> int:
     setup_logging()
     app = QApplication(sys.argv)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = MainWindow()
     window.show()
     return app.exec()

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSettings, QThread, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,6 +31,7 @@ from ui.speaker_rename_dialog import SpeakerRenameDialog
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi")
 AUTOSAVE_DIR = Path.home() / "Documents" / "TranscriberGUI Autosaves"
+ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "icon.ico"
 
 
 def _slugify(name: str) -> str:
@@ -92,7 +93,9 @@ class DropZone(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TranscriberGUI")
+        self.setWindowTitle("Scribe")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(900, 700)
 
         self.video_path: Optional[str] = None
