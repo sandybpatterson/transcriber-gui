@@ -15,8 +15,15 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from core.captions import fetch_captions
 from core.channel_watcher import find_new_videos, list_channels, mark_seen
-from core.engine import TranscriptionCancelled, download_audio, transcribe_audio
+from core.engine import (
+    FALLBACK_MODEL_SIZE,
+    USE_YOUTUBE_CAPTIONS,
+    TranscriptionCancelled,
+    download_audio,
+    transcribe_audio,
+)
 from exporters import export_txt
 
 logger = logging.getLogger(__name__)
@@ -134,6 +141,22 @@ class ChannelCheckWorker(QObject):
         return queue
 
     def _process_one(self, video: dict, channel_name: str) -> None:
+        effective_model_size = self.model_size
+        if self.model_size == USE_YOUTUBE_CAPTIONS:
+            if self.diarize:
+                self.log.emit("  Speaker identification needs real audio -- transcribing instead of using captions.")
+                effective_model_size = FALLBACK_MODEL_SIZE
+            else:
+                self.log.emit("  Checking for existing YouTube captions...")
+                caption_segments = fetch_captions(video["url"], language=self.language)
+                self._check_cancelled()
+                if caption_segments:
+                    logger.info("Using %d caption segment(s) instead of transcribing", len(caption_segments))
+                    self._save_segments(caption_segments, channel_name, video)
+                    return
+                self.log.emit("  No YouTube captions found -- transcribing instead.")
+                effective_model_size = FALLBACK_MODEL_SIZE
+
         with tempfile.TemporaryDirectory(prefix="transcribergui_channel_") as download_dir:
             self.log.emit("  Downloading audio...")
             audio_path = download_audio(
@@ -146,7 +169,7 @@ class ChannelCheckWorker(QObject):
             self.log.emit("  Transcribing...")
             segments = transcribe_audio(
                 audio_path,
-                model_size=self.model_size,
+                model_size=effective_model_size,
                 language=self.language,
                 on_progress=self.log.emit,
             )
@@ -160,6 +183,9 @@ class ChannelCheckWorker(QObject):
                 segments = assign_speakers(segments, speaker_segments)
                 self._check_cancelled()
 
+        self._save_segments(segments, channel_name, video)
+
+    def _save_segments(self, segments, channel_name: str, video: dict) -> None:
         # Each channel gets its own subfolder -- keeps different shows'
         # transcripts from ending up mixed together in one flat folder.
         channel_dir = Path(self.output_dir) / _slugify(channel_name)

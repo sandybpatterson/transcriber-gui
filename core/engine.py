@@ -22,11 +22,21 @@ logger = logging.getLogger(__name__)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
+# A sentinel "model size" meaning "try the video's existing YouTube
+# captions first" rather than an actual Whisper model -- listed first
+# since it's the fastest option when it works. Falls back to a real model
+# (FALLBACK_MODEL_SIZE) if the video has no captions, isn't a URL, or
+# diarization is on (captions carry no speaker info, so that combination
+# always needs real audio regardless of this setting).
+USE_YOUTUBE_CAPTIONS = "youtube_captions"
+FALLBACK_MODEL_SIZE = "base"
+
+MODEL_SIZES = [USE_YOUTUBE_CAPTIONS, "tiny", "base", "small", "medium", "large-v3-turbo"]
 
 # Speed/accuracy hint shown next to each option in the UI -- "tiny" and
 # "large-v3-turbo" mean nothing to someone who's never used Whisper before.
 MODEL_SIZE_LABELS = {
+    USE_YOUTUBE_CAPTIONS: "Use YouTube captions if available (fastest)",
     "tiny": "tiny (fastest)",
     "base": "base (fast)",
     "small": "small (balanced)",
@@ -282,6 +292,38 @@ class TranscriptionWorker(QObject):
             self.video_path, self.model_size, self.language, self.diarize,
         )
         try:
+            effective_model_size = self.model_size
+            if self.model_size == USE_YOUTUBE_CAPTIONS:
+                if self.diarize:
+                    # Captions carry no speaker info at all -- this
+                    # combination always needs real audio regardless of
+                    # the captions preference.
+                    self.progress.emit(
+                        "Speaker identification needs real audio -- transcribing instead of using captions."
+                    )
+                    effective_model_size = FALLBACK_MODEL_SIZE
+                elif not is_url(self.video_path):
+                    self.progress.emit("YouTube captions aren't available for local files -- transcribing instead.")
+                    effective_model_size = FALLBACK_MODEL_SIZE
+                else:
+                    self.progress.emit("Checking for existing YouTube captions...")
+                    from core.captions import fetch_captions
+
+                    caption_segments = fetch_captions(
+                        self.video_path, language=self.language, on_title=self.title_resolved.emit,
+                    )
+                    self._check_cancelled()
+                    if caption_segments:
+                        logger.info("Using %d caption segment(s) instead of transcribing", len(caption_segments))
+                        for seg in caption_segments:
+                            self.segment_ready.emit(seg)
+                            self._check_cancelled()
+                        self.progress.emit("Done (used existing YouTube captions).")
+                        self.finished.emit(caption_segments)
+                        return
+                    self.progress.emit("No YouTube captions found -- transcribing instead.")
+                    effective_model_size = FALLBACK_MODEL_SIZE
+
             if is_url(self.video_path):
                 self.progress.emit("Downloading audio...")
                 download_dir = tempfile.TemporaryDirectory(prefix="transcribergui_")
@@ -314,7 +356,7 @@ class TranscriptionWorker(QObject):
 
             segments = transcribe_audio(
                 audio_path,
-                model_size=self.model_size,
+                model_size=effective_model_size,
                 language=self.language,
                 on_segment=on_segment,
                 on_progress=self.progress.emit,
