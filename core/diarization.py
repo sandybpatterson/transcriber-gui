@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -14,11 +14,19 @@ logger = logging.getLogger(__name__)
 
 TOKEN_CHECK_TIMEOUT_SECONDS = 30
 
-# Both models are gated on Hugging Face (confirmed directly: downloading
-# even their small config.yaml fails with GatedRepoError when unauthorized)
-# -- segmentation-3.0 is a dependency pyannote's pipeline loads internally,
-# so a token needs access to both, not just the one named in diarize_audio.
-REQUIRED_REPOS = ("pyannote/speaker-diarization-3.1", "pyannote/segmentation-3.0")
+# All three are gated on Hugging Face and all three get pulled in by
+# actually running a diarization pass, not just constructing the pipeline
+# -- confirmed the hard way, one at a time, against real audio:
+# segmentation-3.0 loads during pipeline construction, and
+# speaker-diarization-community-1 (a clustering sub-step, "plda/xvec_
+# transform.npz") only gets fetched once the pipeline actually processes
+# a file. There may be more not yet hit by real usage; this list only
+# reflects what's been found so far.
+REQUIRED_REPOS = (
+    "pyannote/speaker-diarization-3.1",
+    "pyannote/segmentation-3.0",
+    "pyannote/speaker-diarization-community-1",
+)
 
 
 def check_hf_token(token: str) -> None:
@@ -120,7 +128,11 @@ class HfTokenTestWorker(QObject):
             self.succeeded.emit()
 
 
-def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple[float, float, str]]:
+def diarize_audio(
+    audio_path: str,
+    hf_token: Optional[str] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> list[tuple[float, float, str]]:
     """Run pyannote's speaker-diarization pipeline, returning (start, end, speaker) turns."""
     # Same reasoning as transcribe_audio's model download: bound the Hub
     # fetch so a dead connection fails fast instead of hanging with no
@@ -131,11 +143,20 @@ def diarize_audio(audio_path: str, hf_token: Optional[str] = None) -> list[tuple
 
     token = hf_token or os.environ.get("HF_TOKEN")
     logger.info("Loading pyannote diarization pipeline")
+    # This step alone can take a minute or more the first time (loading
+    # torch plus several neural network models with no natural progress
+    # percentage to report) -- confirmed live: a user watching a static
+    # "Identifying speakers..." message with no further detail couldn't
+    # tell it apart from a hang. At least name what's actually happening.
+    if on_progress:
+        on_progress("Identifying speakers (loading model -- first run can take a minute)...")
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         token=token,
     )
     logger.info("Running diarization on %s", audio_path)
+    if on_progress:
+        on_progress("Identifying speakers (analyzing audio)...")
     diarization = pipeline(audio_path)
 
     return [

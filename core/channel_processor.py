@@ -145,7 +145,7 @@ class ChannelCheckWorker(QObject):
                 self.log.emit("  Identifying speakers...")
                 from core.diarization import assign_speakers, diarize_audio
 
-                speaker_segments = diarize_audio(audio_path, hf_token=self.hf_token)
+                speaker_segments = diarize_audio(audio_path, hf_token=self.hf_token, on_progress=self.log.emit)
                 segments = assign_speakers(segments, speaker_segments)
                 self._check_cancelled()
 

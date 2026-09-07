@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.diarization import HfTokenTestWorker
+from core.diarization import REQUIRED_REPOS, HfTokenTestWorker
 from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.channel_manager_dialog import ChannelManagerDialog
@@ -176,15 +176,15 @@ class MainWindow(QMainWindow):
         self.diarize_setup_widget = QWidget()
         setup_layout = QVBoxLayout(self.diarize_setup_widget)
         setup_layout.setContentsMargins(0, 0, 0, 0)
+        repo_links = "".join(
+            f"&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/{repo}\">{repo}</a><br>"
+            for repo in REQUIRED_REPOS
+        )
         setup_info = QLabel(
             "Needs a free Hugging Face token (one-time setup):<br>"
             "1. Create a free account: <a href=\"https://huggingface.co/join\">huggingface.co/join</a><br>"
-            "2. While logged in, open these two model pages (both are gated) and "
-            "request/accept access if prompted:<br>"
-            "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/speaker-diarization-3.1\">"
-            "pyannote/speaker-diarization-3.1</a><br>"
-            "&nbsp;&nbsp;&nbsp;&bull; <a href=\"https://huggingface.co/pyannote/segmentation-3.0\">"
-            "pyannote/segmentation-3.0</a> (a dependency of the model above)<br>"
+            f"2. While logged in, open these model pages (all gated) and "
+            f"request/accept access if prompted:<br>{repo_links}"
             "3. Create a token (\"Read\" access is enough): "
             "<a href=\"https://huggingface.co/settings/tokens\">huggingface.co/settings/tokens</a><br>"
             "4. Paste it below and click \"Test &amp; Save\"."
@@ -298,13 +298,23 @@ class MainWindow(QMainWindow):
         if checked:
             self._refresh_diarize_setup_state()
 
+    @staticmethod
+    def _verification_key(token: str) -> str:
+        # Ties "verified" to both the token AND the current set of
+        # required repos -- so adding a newly-discovered gated dependency
+        # (this has happened more than once) automatically invalidates a
+        # prior verification instead of leaving a stale "verified" state
+        # for a check that covered fewer repos than are now needed.
+        return token + "::" + ",".join(REQUIRED_REPOS)
+
     def _refresh_diarize_setup_state(self) -> None:
-        # "Verified" means this exact token string already passed a real
-        # access check -- editing the field at all falls back to setup
-        # state, since the new value hasn't been tested yet.
+        # "Verified" means this exact token already passed a real access
+        # check against the current required-repos list -- editing the
+        # field, or the app adding a newly-discovered repo, falls back to
+        # setup state since that hasn't been (re)tested yet.
         token = self.hf_token_input.text().strip()
-        verified_token = self._settings.value("hf_token_verified_value", "", type=str)
-        is_verified = bool(token) and token == verified_token
+        verified_key = self._settings.value("hf_token_verified_key", "", type=str)
+        is_verified = bool(token) and self._verification_key(token) == verified_key
         self.diarize_setup_widget.setVisible(not is_verified)
         self.diarize_verified_widget.setVisible(is_verified)
 
@@ -320,7 +330,7 @@ class MainWindow(QMainWindow):
             return
 
         self.hf_token_test_button.setEnabled(False)
-        self.hf_token_status_label.setText("Checking access to both required models...")
+        self.hf_token_status_label.setText(f"Checking access to all {len(REQUIRED_REPOS)} required models...")
 
         self._token_test_worker = HfTokenTestWorker(token)
         self._token_test_thread = QThread()
@@ -345,7 +355,7 @@ class MainWindow(QMainWindow):
             return
         token = self.hf_token_input.text().strip()
         self._settings.setValue("hf_token", token)
-        self._settings.setValue("hf_token_verified_value", token)
+        self._settings.setValue("hf_token_verified_key", self._verification_key(token))
         self.hf_token_status_label.setText("")
         self._refresh_diarize_setup_state()
 
