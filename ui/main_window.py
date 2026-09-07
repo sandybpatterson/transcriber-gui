@@ -106,6 +106,16 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("TranscriberGUI", "TranscriberGUI")
         self._channel_dialog: Optional[ChannelManagerDialog] = None
 
+        # Batch state: set by _start_batch(), consumed as each item's
+        # worker finishes/fails/cancels. None means "not running a batch"
+        # -- every batch-aware handler below checks this first so the
+        # normal single-video flow (the common case) stays completely
+        # unaffected when it's None.
+        self._batch_queue: Optional[list[dict]] = None
+        self._batch_index: int = 0
+        self._batch_output_dir: Optional[Path] = None
+        self._batch_failures: list[str] = []
+
         self._build_ui()
 
     def closeEvent(self, event) -> None:
@@ -160,6 +170,9 @@ class MainWindow(QMainWindow):
 
         channels_row = QHBoxLayout()
         channels_row.addStretch(1)
+        batch_button = QPushButton("Transcribe multiple URLs...")
+        batch_button.clicked.connect(self._open_batch_setup)
+        channels_row.addWidget(batch_button)
         watch_channels_button = QPushButton("Watch YouTube Channels...")
         watch_channels_button.clicked.connect(self._open_channel_manager)
         channels_row.addWidget(watch_channels_button)
@@ -323,6 +336,66 @@ class MainWindow(QMainWindow):
         self._channel_dialog.show()
         self._channel_dialog.raise_()
         self._channel_dialog.activateWindow()
+
+    # ------------------------------------------------------------------
+    # Batch (multiple pasted URLs)
+    # ------------------------------------------------------------------
+    def _open_batch_setup(self) -> None:
+        from ui.batch_setup_dialog import BatchSetupDialog
+
+        dialog = BatchSetupDialog(self)
+        if dialog.exec() and dialog.queue:
+            self._start_batch(dialog.queue, dialog.output_dir)
+
+    def _start_batch(self, queue: list[dict], output_dir: Path) -> None:
+        if self._worker is not None:
+            QMessageBox.warning(
+                self, "Already running",
+                "A transcription is already in progress. Wait for it to finish, or cancel it, first.",
+            )
+            return
+        self._batch_queue = queue
+        self._batch_index = 0
+        self._batch_output_dir = output_dir
+        self._batch_failures = []
+        self._run_current_batch_item()
+
+    def _run_current_batch_item(self) -> None:
+        item = self._batch_queue[self._batch_index]
+        self.url_input.setText(item["url"])
+        self._use_url()
+        self._start_transcription()
+
+    def _batch_progress_text(self) -> str:
+        return f"({self._batch_index + 1}/{len(self._batch_queue)})"
+
+    def _export_current_batch_item(self, segments) -> None:
+        item = self._batch_queue[self._batch_index]
+        out_path = _unique_path(self._batch_output_dir, Path(item["filename"]).stem, ".txt")
+        try:
+            self._batch_output_dir.mkdir(parents=True, exist_ok=True)
+            export_txt(segments, str(out_path))
+        except OSError as exc:
+            self._batch_failures.append(f"{item['filename']} (save failed: {exc})")
+
+    def _advance_or_finish_batch(self) -> None:
+        self._batch_index += 1
+        if self._batch_index >= len(self._batch_queue):
+            self._finish_batch()
+            return
+        self._run_current_batch_item()
+
+    def _finish_batch(self) -> None:
+        total = len(self._batch_queue)
+        failed = len(self._batch_failures)
+        summary = f"Batch complete: {total - failed}/{total} saved to {self._batch_output_dir}"
+        if self._batch_failures:
+            summary += "\nFailed: " + "; ".join(self._batch_failures)
+        self.status_label.setText(summary)
+        self._batch_queue = None
+        self._batch_index = 0
+        self._batch_output_dir = None
+        self._batch_failures = []
 
     # ------------------------------------------------------------------
     # Transcription
@@ -512,6 +585,13 @@ class MainWindow(QMainWindow):
         if self.sender() is not self._thread:
             return
         self._detach_thread(delete=True)
+        # By this point self._worker/_thread are already None (set just
+        # above), so the next item's _start_transcription() won't trip
+        # the "already running" guard. A cancelled batch already cleared
+        # _batch_queue back in _on_transcription_cancelled, so this only
+        # fires here for a completed or failed item -- both continue.
+        if self._batch_queue is not None:
+            self._advance_or_finish_batch()
 
     def _detach_thread(self, delete: bool) -> None:
         self.progress_bar.setVisible(False)
@@ -537,6 +617,8 @@ class MainWindow(QMainWindow):
         # diarization) -- _on_segment_progress switches it to determinate once
         # transcription starts reporting real percentages.
         self.progress_bar.setRange(0, 0)
+        if self._batch_queue is not None:
+            message = f"{message} {self._batch_progress_text()}"
         self.status_label.setText(message)
 
     def _on_segment_progress(self, percent: int, seconds_done: float, total_seconds: float) -> None:
@@ -544,16 +626,26 @@ class MainWindow(QMainWindow):
             return
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(percent)
-        self.status_label.setText(
+        text = (
             f"Transcribing... {percent}% "
             f"({_format_hms(seconds_done)} / {_format_hms(total_seconds)})"
         )
+        if self._batch_queue is not None:
+            text = f"{text} {self._batch_progress_text()}"
+        self.status_label.setText(text)
 
     def _on_transcription_finished(self, segments) -> None:
         if self.sender() is not self._worker:
             return
-        self._maybe_rename_speakers(segments)
         self.results_view.set_segments(segments)
+        if self._batch_queue is not None:
+            # No interactive speaker-rename in batch mode -- the whole
+            # point is walking away while several videos process
+            # unattended, not babysitting a rename prompt per video.
+            self._export_current_batch_item(segments)
+            self._set_export_enabled(bool(segments))
+            return
+        self._maybe_rename_speakers(segments)
         self.status_label.setText(f"Done — {len(segments)} segments.")
         self._set_export_enabled(bool(segments))
 
@@ -588,12 +680,29 @@ class MainWindow(QMainWindow):
     def _on_transcription_failed(self, message: str) -> None:
         if self.sender() is not self._worker:
             return
+        if self._batch_queue is not None:
+            # One bad link (private video, deleted, typo) shouldn't stop
+            # the rest of the batch -- note it and keep going, same
+            # philosophy as the channel watcher's per-video handling.
+            item = self._batch_queue[self._batch_index]
+            self._batch_failures.append(f"{item['filename']} ({message})")
+            return
         self.status_label.setText("Failed.")
         note = self._autosave_note()
         QMessageBox.critical(self, "Transcription failed", f"{message}{note}")
 
     def _on_transcription_cancelled(self) -> None:
         if self.sender() is not self._worker:
+            return
+        if self._batch_queue is not None:
+            done = self._batch_index
+            total = len(self._batch_queue)
+            self.status_label.setText(f"Batch cancelled after {done}/{total} video(s).")
+            self._batch_queue = None
+            self._batch_index = 0
+            self._batch_output_dir = None
+            self._batch_failures = []
+            self._set_export_enabled(bool(self.results_view.segments()))
             return
         self.status_label.setText(f"Cancelled.{self._autosave_note()}")
         self._set_export_enabled(bool(self.results_view.segments()))

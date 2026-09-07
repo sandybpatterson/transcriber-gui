@@ -74,6 +74,17 @@ def is_url(path: str) -> bool:
     return urlparse(path).scheme in ("http", "https")
 
 
+def fetch_video_title(url: str) -> str:
+    """Looks up a video's title without downloading anything -- used to
+    pre-fill a suggested filename before a batch actually runs."""
+    import yt_dlp
+
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return info.get("title") or url
+
+
 def download_audio(
     url: str,
     output_dir: str,
