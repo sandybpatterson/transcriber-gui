@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.diarization import verification_key
-from core.engine import LANGUAGES, MODEL_SIZES, TranscriptionWorker, is_url
+from core.engine import LANGUAGES, MODEL_SIZE_LABELS, MODEL_SIZES, TranscriptionWorker, is_url
 from exporters import export_docx, export_srt, export_txt
 from ui.channel_manager_dialog import ChannelManagerDialog
 from ui.diarization_setup_wizard import DiarizationSetupWizard
@@ -147,10 +147,11 @@ class MainWindow(QMainWindow):
         options_row = QHBoxLayout()
 
         model_col = QVBoxLayout()
-        model_col.addWidget(QLabel("Model size"))
+        model_col.addWidget(QLabel("Transcription quality"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems(MODEL_SIZES)
-        self.model_combo.setCurrentText("base")
+        for size in MODEL_SIZES:
+            self.model_combo.addItem(MODEL_SIZE_LABELS.get(size, size), size)
+        self.model_combo.setCurrentIndex(MODEL_SIZES.index("base"))
         model_col.addWidget(self.model_combo)
         options_row.addLayout(model_col)
 
@@ -291,11 +292,11 @@ class MainWindow(QMainWindow):
         hf_token = self._get_hf_token() or None
         if self._channel_dialog is None:
             self._channel_dialog = ChannelManagerDialog(
-                self, self.model_combo.currentText(), language, diarize, hf_token
+                self, self.model_combo.currentData(), language, diarize, hf_token
             )
         else:
             self._channel_dialog.update_transcription_settings(
-                self.model_combo.currentText(), language, diarize, hf_token
+                self.model_combo.currentData(), language, diarize, hf_token
             )
         self._channel_dialog.show()
         self._channel_dialog.raise_()
@@ -325,7 +326,7 @@ class MainWindow(QMainWindow):
 
         self._worker = TranscriptionWorker(
             video_path=self.video_path,
-            model_size=self.model_combo.currentText(),
+            model_size=self.model_combo.currentData(),
             language=language,
             diarize=self.diarize_checkbox.isChecked(),
             hf_token=self._get_hf_token() or None,

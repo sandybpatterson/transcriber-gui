@@ -24,6 +24,16 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
+# Speed/accuracy hint shown next to each option in the UI -- "tiny" and
+# "large-v3-turbo" mean nothing to someone who's never used Whisper before.
+MODEL_SIZE_LABELS = {
+    "tiny": "tiny (fastest)",
+    "base": "base (fast)",
+    "small": "small (balanced)",
+    "medium": "medium (accurate)",
+    "large-v3-turbo": "large-v3-turbo (most accurate)",
+}
+
 LANGUAGES = {
     "Auto-detect": None,
     "English": "en",
