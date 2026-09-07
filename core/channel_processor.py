@@ -51,6 +51,7 @@ class ChannelCheckWorker(QObject):
         language: Optional[str] = None,
         diarize: bool = False,
         hf_token: Optional[str] = None,
+        explicit_queue: Optional[list[tuple[str, str, dict]]] = None,
     ):
         super().__init__()
         self.output_dir = output_dir
@@ -58,6 +59,12 @@ class ChannelCheckWorker(QObject):
         self.language = language
         self.diarize = diarize
         self.hf_token = hf_token
+        # (channel_url, channel_name, video) tuples to process directly,
+        # bypassing the "find new videos" scan -- used to manually re-run
+        # a specific already-seen video (e.g. one from a channel's
+        # baseline right after adding it) rather than only ever picking
+        # up genuinely new ones.
+        self._explicit_queue = explicit_queue
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -75,37 +82,23 @@ class ChannelCheckWorker(QObject):
                     "Speaker identification needs a free Hugging Face token. "
                     "Add one in the main window and try again."
                 )
-            channels = list_channels()
-            if not channels:
-                self.log.emit("No channels are being watched yet.")
-                self.finished.emit(0)
-                return
 
-            queue: list[tuple[str, dict]] = []
-            for url, info in channels.items():
-                self.log.emit(f"Checking {info['name']}...")
-                new_videos = find_new_videos(url)
-                self._check_cancelled()
-                if new_videos:
-                    self.log.emit(f"  {len(new_videos)} new video(s).")
-                    queue.extend((url, video) for video in new_videos)
-                else:
-                    self.log.emit("  Nothing new.")
-
-            if not queue:
-                self.log.emit("No new videos found across any watched channel.")
-                self.finished.emit(0)
-                return
+            if self._explicit_queue is not None:
+                queue = list(self._explicit_queue)
+            else:
+                queue = self._find_new_videos_queue()
+                if queue is None:  # already reported via self.finished
+                    return
 
             Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             processed = 0
-            for channel_url, video in queue:
+            for channel_url, channel_name, video in queue:
                 self._check_cancelled()
                 self.log.emit(f"Processing: {video['title']}")
                 logger.info("Processing video %s (%s)", video["id"], video["title"])
                 try:
-                    self._process_one(video)
-                    mark_seen(channel_url, video["id"])
+                    self._process_one(video, channel_name)
+                    mark_seen(channel_url, video["id"], video["title"])
                     processed += 1
                 except TranscriptionCancelled:
                     raise
@@ -113,7 +106,7 @@ class ChannelCheckWorker(QObject):
                     logger.exception("Failed processing video %s", video["id"])
                     self.log.emit(f"  Failed ({exc}) -- will retry next check.")
 
-            self.log.emit(f"Done. {processed} of {len(queue)} new video(s) transcribed.")
+            self.log.emit(f"Done. {processed} of {len(queue)} video(s) transcribed.")
             logger.info("Channel check finished: %d/%d processed", processed, len(queue))
             self.finished.emit(processed)
         except TranscriptionCancelled:
@@ -123,7 +116,34 @@ class ChannelCheckWorker(QObject):
             logger.exception("Channel check failed")
             self.failed.emit(str(exc))
 
-    def _process_one(self, video: dict) -> None:
+    def _find_new_videos_queue(self) -> Optional[list[tuple[str, str, dict]]]:
+        """Returns (channel_url, channel_name, video) tuples for every new
+        video across all watched channels, or None if there's nothing to
+        do (having already emitted `finished` itself in that case)."""
+        channels = list_channels()
+        if not channels:
+            self.log.emit("No channels are being watched yet.")
+            self.finished.emit(0)
+            return None
+
+        queue: list[tuple[str, str, dict]] = []
+        for url, info in channels.items():
+            self.log.emit(f"Checking {info['name']}...")
+            new_videos = find_new_videos(url)
+            self._check_cancelled()
+            if new_videos:
+                self.log.emit(f"  {len(new_videos)} new video(s).")
+                queue.extend((url, info["name"], video) for video in new_videos)
+            else:
+                self.log.emit("  Nothing new.")
+
+        if not queue:
+            self.log.emit("No new videos found across any watched channel.")
+            self.finished.emit(0)
+            return None
+        return queue
+
+    def _process_one(self, video: dict, channel_name: str) -> None:
         with tempfile.TemporaryDirectory(prefix="transcribergui_channel_") as download_dir:
             self.log.emit("  Downloading audio...")
             audio_path = download_audio(
@@ -149,6 +169,10 @@ class ChannelCheckWorker(QObject):
                 segments = assign_speakers(segments, speaker_segments)
                 self._check_cancelled()
 
-        out_path = _unique_path(Path(self.output_dir), _slugify(video["title"]), ".txt")
+        # Each channel gets its own subfolder -- keeps different shows'
+        # transcripts from ending up mixed together in one flat folder.
+        channel_dir = Path(self.output_dir) / _slugify(channel_name)
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        out_path = _unique_path(channel_dir, _slugify(video["title"]), ".txt")
         export_txt(segments, str(out_path))
         self.log.emit(f"  Saved: {out_path}")

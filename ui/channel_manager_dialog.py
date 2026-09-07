@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from core.channel_processor import ChannelCheckWorker
 from core.channel_watcher import add_channel, list_channels, remove_channel
+from ui.channel_videos_dialog import ChannelVideosDialog
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "YouTube Channel Transcripts"
 
@@ -74,12 +75,14 @@ class ChannelManagerDialog(QDialog):
             "Adding a channel records its current videos as a baseline -- only "
             "videos published after that point will ever be transcribed "
             "automatically, so a long-running show's back catalog is never "
-            "processed all at once."
+            "processed all at once. Double-click a channel to see exactly "
+            "which videos it's tracking, and optionally re-run one of them."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         self.channel_list = QListWidget()
+        self.channel_list.itemDoubleClicked.connect(self._open_channel_videos)
         layout.addWidget(self.channel_list, stretch=1)
 
         channel_row = QHBoxLayout()
@@ -103,7 +106,10 @@ class ChannelManagerDialog(QDialog):
 
         action_row = QHBoxLayout()
         self.check_button = QPushButton("Check for new episodes now")
-        self.check_button.clicked.connect(self._start_check)
+        # Not a direct connection: QPushButton.clicked emits a bool, which
+        # would otherwise land in _start_check's explicit_queue parameter
+        # (confirmed directly) now that it has one.
+        self.check_button.clicked.connect(lambda: self._start_check())
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setVisible(False)
         self.cancel_button.clicked.connect(self._cancel_check)
@@ -134,9 +140,16 @@ class ChannelManagerDialog(QDialog):
     def _reload_channel_list(self) -> None:
         self.channel_list.clear()
         for url, info in list_channels().items():
-            item = QListWidgetItem(f"{info['name']}  ({len(info['seen_ids'])} tracked)")
+            item = QListWidgetItem(f"{info['name']}  ({len(info['seen_videos'])} tracked)")
             item.setData(Qt.ItemDataRole.UserRole, url)
             self.channel_list.addItem(item)
+
+    def _open_channel_videos(self, item: QListWidgetItem) -> None:
+        url = item.data(Qt.ItemDataRole.UserRole)
+        name = list_channels().get(url, {}).get("name", url)
+        dialog = ChannelVideosDialog(self, url, name)
+        if dialog.exec() and dialog.selected_video is not None:
+            self._start_check(explicit_queue=[(url, name, dialog.selected_video)])
 
     def _add_channel(self) -> None:
         url, ok = QInputDialog.getText(
@@ -157,7 +170,7 @@ class ChannelManagerDialog(QDialog):
         QMessageBox.information(
             self,
             "Channel added",
-            f"Now watching \"{record['name']}\". Its current {len(record['seen_ids'])} "
+            f"Now watching \"{record['name']}\". Its current {len(record['seen_videos'])} "
             "video(s) are the baseline -- only videos published after now will be transcribed.",
         )
 
@@ -171,7 +184,7 @@ class ChannelManagerDialog(QDialog):
     # ------------------------------------------------------------------
     # Checking / processing
     # ------------------------------------------------------------------
-    def _start_check(self) -> None:
+    def _start_check(self, explicit_queue: Optional[list[tuple[str, str, dict]]] = None) -> None:
         self.check_button.setEnabled(False)
         self.cancel_button.setVisible(True)
         self.log_view.clear()
@@ -182,6 +195,7 @@ class ChannelManagerDialog(QDialog):
             language=self._language,
             diarize=self._diarize,
             hf_token=self._hf_token,
+            explicit_queue=explicit_queue,
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)

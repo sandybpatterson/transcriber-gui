@@ -2,7 +2,7 @@
 
 Uses yt-dlp's flat extraction (metadata only, no downloads) to list a
 channel's videos cheaply, and a small JSON registry to remember which
-video ids have already been seen so repeat checks only surface new ones.
+videos have already been seen so repeat checks only surface new ones.
 """
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +35,53 @@ def _save_registry(data: dict) -> None:
     REGISTRY_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _seen_videos(channel: dict) -> list[dict]:
+    """Normalizes both the current schema ("seen_videos": [{"id","title"}])
+    and the older one ("seen_ids": [str, ...]) into the richer form, so a
+    registry written by an earlier version of the app still reads fine."""
+    if "seen_videos" in channel:
+        return channel["seen_videos"]
+    return [{"id": vid, "title": vid} for vid in channel.get("seen_ids", [])]
+
+
 def list_channels() -> dict:
-    """channel_url -> {"name": str, "seen_ids": [str, ...]}"""
-    return _load_registry()["channels"]
+    """channel_url -> {"name": str, "seen_videos": [{"id", "title"}, ...]}"""
+    registry = _load_registry()
+    for channel in registry["channels"].values():
+        channel["seen_videos"] = _seen_videos(channel)
+        channel.pop("seen_ids", None)
+    return registry["channels"]
+
+
+def get_channel_videos(channel_url: str) -> list[dict]:
+    """The videos currently recorded as seen for this channel (baseline
+    plus anything processed since) -- each with "id", "title", "url"."""
+    channel = list_channels().get(channel_url)
+    if channel is None:
+        return []
+    return [
+        {"id": v["id"], "title": v.get("title") or v["id"], "url": f"https://www.youtube.com/watch?v={v['id']}"}
+        for v in channel["seen_videos"]
+    ]
+
+
+_CHANNEL_TABS = ("/videos", "/shorts", "/streams", "/playlists", "/community", "/featured")
+
+
+def normalize_channel_url(url: str) -> str:
+    """A bare channel URL (https://youtube.com/@name, /channel/UC..., etc.)
+    resolves in yt-dlp's flat listing to its tab-selection page -- Videos,
+    Live, and Shorts each as a *nested* playlist entry reusing the
+    channel's own id, not an actual video list. Confirmed directly: this
+    is exactly what produced "3 videos" that were really just those 3
+    tabs. Appending /videos when no tab or specific path is already
+    present forces it straight to the uploads list instead."""
+    url = url.rstrip("/")
+    if any(url.endswith(tab) for tab in _CHANNEL_TABS):
+        return url
+    if "watch?v=" in url or "/playlist" in url or "list=" in url:
+        return url  # not a bare channel URL at all -- leave it alone
+    return url + "/videos"
 
 
 def _fetch_recent_videos(channel_url: str) -> tuple[str, list[dict]]:
@@ -52,21 +95,31 @@ def _fetch_recent_videos(channel_url: str) -> tuple[str, list[dict]]:
         "no_warnings": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(channel_url, download=False)
+        info = ydl.extract_info(normalize_channel_url(channel_url), download=False)
     name = info.get("title") or channel_url
-    entries = [e for e in (info.get("entries") or []) if e.get("id")]
+    for suffix in (" - Videos", " - Live", " - Shorts"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    # Defense in depth alongside normalize_channel_url(): a nested tab
+    # pointer (Videos/Live/Shorts) comes back with _type "playlist" and
+    # reuses the channel's own id instead of being a real video -- skip
+    # any that still slip through.
+    entries = [e for e in (info.get("entries") or []) if e.get("id") and e.get("_type") != "playlist"]
+    logger.info("%s: yt-dlp flat-listing returned %d entries (cap %d)", channel_url, len(entries), RECENT_VIDEOS_TO_CHECK)
     return name, entries
 
 
 def add_channel(channel_url: str) -> dict:
     """Fetches the channel's current videos and baselines all of them as
     already-seen -- only videos published after this point count as new."""
+    channel_url = normalize_channel_url(channel_url)
     logger.info("Adding channel: %s", channel_url)
     name, entries = _fetch_recent_videos(channel_url)
     registry = _load_registry()
     registry["channels"][channel_url] = {
         "name": name,
-        "seen_ids": [e["id"] for e in entries],
+        "seen_videos": [{"id": e["id"], "title": e.get("title") or e["id"]} for e in entries],
     }
     _save_registry(registry)
     logger.info("Added channel %r (%s) with %d baseline video(s)", name, channel_url, len(entries))
@@ -87,7 +140,7 @@ def find_new_videos(channel_url: str) -> list[dict]:
     channel = registry["channels"].get(channel_url)
     if channel is None:
         return []
-    seen = set(channel["seen_ids"])
+    seen = {v["id"] for v in _seen_videos(channel)}
     _, entries = _fetch_recent_videos(channel_url)
     new_entries = [e for e in entries if e["id"] not in seen]
     new_entries.reverse()
@@ -98,11 +151,14 @@ def find_new_videos(channel_url: str) -> list[dict]:
     ]
 
 
-def mark_seen(channel_url: str, video_id: str) -> None:
+def mark_seen(channel_url: str, video_id: str, title: str = "") -> None:
     registry = _load_registry()
     channel = registry["channels"].get(channel_url)
     if channel is None:
         return
-    if video_id not in channel["seen_ids"]:
-        channel["seen_ids"].append(video_id)
+    videos = _seen_videos(channel)
+    if video_id not in {v["id"] for v in videos}:
+        videos.append({"id": video_id, "title": title or video_id})
+        channel["seen_videos"] = videos
+        channel.pop("seen_ids", None)
         _save_registry(registry)
