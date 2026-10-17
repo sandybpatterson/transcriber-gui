@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from core.engine import fetch_video_title, is_url
+from core.engine import fetch_video_title, is_url, url_fallback_name
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "Batch Transcripts"
 
@@ -81,7 +81,7 @@ class BatchSetupDialog(QDialog):
         layout.addWidget(QLabel("Paste one video URL per line:"))
         self.url_box = QTextEdit()
         self.url_box.setPlaceholderText(
-            "https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=..."
+            "https://www.youtube.com/watch?v=...\nhttps://www.facebook.com/watch/?v=..."
         )
         layout.addWidget(self.url_box, stretch=1)
 
@@ -151,7 +151,7 @@ class BatchSetupDialog(QDialog):
             video_item = QTableWidgetItem(url)
             video_item.setFlags(video_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, 0, video_item)
-            fallback_name = url.rstrip("/").rsplit("/", 1)[-1]
+            fallback_name = url_fallback_name(url)
             self.table.setItem(row, 1, QTableWidgetItem(_slugify(fallback_name)))
 
         self.lookup_button.setEnabled(False)

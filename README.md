@@ -19,6 +19,15 @@ said what.
 ## Features
 
 - Drag-and-drop or browse to select a video (`.mp4`, `.mov`, `.mkv`, `.avi`)
+- Or paste a video URL — YouTube, Facebook (watch, reels, Page videos,
+  `fb.watch` links), or anything else `yt-dlp` supports — one at a time or
+  as a batch of many. Audio only is fetched, never the full video
+- Uses a video's existing captions when it has them (fastest), falling
+  back to Whisper when it doesn't
+- Optional sign-in for private videos (most Facebook videos outside public
+  Pages need it): reuse your Firefox login, or point at an exported
+  `cookies.txt` (Chrome and Edge lock their cookies on Windows, so use the
+  file option with those)
 - Audio extraction via `ffmpeg` (fetched automatically on first run — no
   need to have it on your `PATH`)
 - Transcription via `faster-whisper`, with a choice of model size

@@ -23,7 +23,17 @@ from PySide6.QtWidgets import (
 )
 
 from core.diarization import verification_key
-from core.engine import LANGUAGES, MODEL_SIZE_LABELS, MODEL_SIZES, TranscriptionWorker, is_url
+from core.engine import (
+    COOKIES_FILE,
+    COOKIES_FIREFOX,
+    COOKIES_NONE,
+    LANGUAGES,
+    MODEL_SIZE_LABELS,
+    MODEL_SIZES,
+    TranscriptionWorker,
+    is_url,
+    url_fallback_name,
+)
 from exporters import export_docx, export_srt, export_txt
 from ui.channel_manager_dialog import ChannelManagerDialog
 from ui.diarization_setup_wizard import DiarizationSetupWizard
@@ -41,7 +51,7 @@ def _slugify(name: str) -> str:
 
 
 def _fallback_name(video_path: str) -> str:
-    return video_path.rstrip("/").rsplit("/", 1)[-1] if is_url(video_path) else Path(video_path).stem
+    return url_fallback_name(video_path) if is_url(video_path) else Path(video_path).stem
 
 
 def _unique_path(directory: Path, stem: str, suffix: str) -> Path:
@@ -163,7 +173,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(browse_row)
 
         url_row = QHBoxLayout()
-        url_row.addWidget(QLabel("Or paste a video URL (YouTube, etc.):"))
+        url_row.addWidget(QLabel("Or paste a video URL (YouTube, Facebook, etc.):"))
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
         self.url_input.returnPressed.connect(self._use_url)
@@ -200,6 +210,22 @@ class MainWindow(QMainWindow):
         self.language_combo.addItems(LANGUAGES.keys())
         language_col.addWidget(self.language_combo)
         options_row.addLayout(language_col)
+
+        signin_col = QVBoxLayout()
+        signin_col.addWidget(QLabel("Sign in for private videos"))
+        self.cookies_combo = QComboBox()
+        self.cookies_combo.addItem("Don't sign in", COOKIES_NONE)
+        self.cookies_combo.addItem("Use my Firefox login", COOKIES_FIREFOX)
+        self.cookies_combo.addItem("Use a cookies.txt file...", COOKIES_FILE)
+        self.cookies_combo.setToolTip(
+            "Most Facebook videos outside public Pages (friends-only posts, groups,\n"
+            "many reels) can only be fetched while signed in. Firefox's login is read\n"
+            "directly; Chrome and Edge lock theirs, so export a cookies.txt instead."
+        )
+        self._select_cookies_source(self._settings.value("cookies_source", COOKIES_NONE, type=str))
+        self.cookies_combo.activated.connect(self._on_cookies_source_chosen)
+        signin_col.addWidget(self.cookies_combo)
+        options_row.addLayout(signin_col)
 
         layout.addLayout(options_row)
 
@@ -300,6 +326,25 @@ class MainWindow(QMainWindow):
         self.video_path = path
         self.file_label.setText(path if is_url(path) else Path(path).name)
         self.start_button.setEnabled(True)
+
+    def _select_cookies_source(self, source: str) -> None:
+        index = self.cookies_combo.findData(source)
+        self.cookies_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _on_cookies_source_chosen(self, _index: int) -> None:
+        source = self.cookies_combo.currentData()
+        if source == COOKIES_FILE:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select an exported cookies.txt file", "", "Cookie files (*.txt);;All files (*)"
+            )
+            if not path:
+                # Backing out of the picker means "never mind" -- keep
+                # whatever was in effect before rather than a file option
+                # with no file behind it.
+                self._select_cookies_source(self._settings.value("cookies_source", COOKIES_NONE, type=str))
+                return
+            self._settings.setValue("cookies_file", path)
+        self._settings.setValue("cookies_source", source)
 
     def _get_hf_token(self) -> str:
         return self._settings.value("hf_token", "", type=str)

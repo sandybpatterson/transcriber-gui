@@ -88,6 +88,32 @@ against a real short video is the highest-value next check.
 
 ---
 
+## Facebook Videos (added 2026-10-17)
+
+URL input, batch URLs, and the "use existing captions" option all work for
+Facebook as well as YouTube — `yt-dlp` already had the extractors; the
+changes were around it:
+- `url_fallback_name()` in `core/engine.py` — the old "everything after the
+  last `/`" fallback turned `facebook.com/watch/?v=ID` into `?v=ID`; it now
+  reads the `v` query parameter (fixes YouTube `watch?v=` names too).
+- **Sign-in cookies** — a "Sign in for private videos" dropdown in the main
+  window (`cookies_source` / `cookies_file` in QSettings), applied to every
+  yt-dlp call via `ytdlp_auth_opts()`. Firefox only, deliberately: Chrome
+  127+ and Edge use app-bound cookie encryption on Windows that yt-dlp
+  can't read, so offering them would be a setting that silently fails.
+  Chrome/Edge users export a `cookies.txt` instead.
+- `explain_download_error()` appends a plain-English "you probably need to
+  sign in" hint to yt-dlp's cryptic Facebook login errors.
+- Caption language matching adds `xx_.*` patterns, since Facebook keys
+  caption tracks by locale (`en_US`) where YouTube uses `en`.
+- The channel watcher is still YouTube-only. Not touched.
+
+**Not tested against real Facebook.** The sandbox's proxy blocks
+facebook.com outright, so verification was offline only: helper functions,
+yt-dlp extractor matching for each URL shape, `.srt` caption parsing, and
+the main window building headless. First real-world check: one public
+Facebook video, then one friends-only video with Firefox sign-in.
+
 ## A Real Bug Found by Actually Running It, and How It Was Fixed
 
 Worth understanding before touching `core/engine.py` or

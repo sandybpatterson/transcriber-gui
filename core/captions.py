@@ -1,4 +1,4 @@
-"""Pull a YouTube video's existing captions instead of running Whisper.
+"""Pull a video's existing captions (YouTube, Facebook, etc.) instead of running Whisper.
 
 Manual (creator-uploaded) captions are usually high quality; auto-
 generated ones vary but are often still usable and are essentially free
@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from core.engine import Segment
+from core.engine import Segment, ytdlp_auth_opts
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +57,15 @@ def fetch_captions(
             "skip_download": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "subtitleslangs": [lang, "en"],
+            # YouTube keys caption tracks by plain codes ("en"); Facebook
+            # uses locales ("en_US"). The underscore patterns (yt-dlp
+            # treats each entry as a regex) catch Facebook's without
+            # widening YouTube's, whose regional variants use hyphens.
+            "subtitleslangs": [lang, "en", f"{lang}_.*", "en_.*"],
             "subtitlesformat": "vtt",
             "outtmpl": str(Path(tmp_dir) / "%(id)s.%(ext)s"),
             "noplaylist": True,
+            **ytdlp_auth_opts(),
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -72,7 +77,9 @@ def fetch_captions(
         if on_title:
             on_title(info.get("title") or url)
 
-        caption_files = list(Path(tmp_dir).glob("*.vtt")) + list(Path(tmp_dir).glob("*.srt"))
+        # Sorted so a video with several matching tracks always yields the
+        # same one, rather than whatever order the filesystem lists them.
+        caption_files = sorted(Path(tmp_dir).glob("*.vtt")) + sorted(Path(tmp_dir).glob("*.srt"))
         if not caption_files:
             logger.info("No captions found for %s", url)
             return None

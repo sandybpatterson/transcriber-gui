@@ -14,16 +14,17 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QSettings, Signal
 
 logger = logging.getLogger(__name__)
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-# A sentinel "model size" meaning "try the video's existing YouTube
-# captions first" rather than an actual Whisper model -- listed first
+# A sentinel "model size" meaning "try the video's existing captions
+# first" (YouTube's, or any other site yt-dlp can pull them from, e.g.
+# Facebook) rather than an actual Whisper model -- listed first
 # since it's the fastest option when it works. Falls back to a real model
 # (FALLBACK_MODEL_SIZE) if the video has no captions, isn't a URL, or
 # diarization is on (captions carry no speaker info, so that combination
@@ -36,7 +37,7 @@ MODEL_SIZES = [USE_YOUTUBE_CAPTIONS, "tiny", "base", "small", "medium", "large-v
 # Speed/accuracy hint shown next to each option in the UI -- "tiny" and
 # "large-v3-turbo" mean nothing to someone who's never used Whisper before.
 MODEL_SIZE_LABELS = {
-    USE_YOUTUBE_CAPTIONS: "Use YouTube captions if available (fastest)",
+    USE_YOUTUBE_CAPTIONS: "Use the video's own captions if available (fastest)",
     "tiny": "tiny (fastest)",
     "base": "base (fast)",
     "small": "small (balanced)",
@@ -80,8 +81,86 @@ def find_ffmpeg() -> str:
 
 
 def is_url(path: str) -> bool:
-    """True if `path` looks like a URL (YouTube, etc.) rather than a local file."""
+    """True if `path` looks like a URL (YouTube, Facebook, etc.) rather than a local file."""
     return urlparse(path).scheme in ("http", "https")
+
+
+def url_fallback_name(url: str) -> str:
+    """A filename-ish stand-in for a URL whose real title isn't known yet.
+
+    Taking everything after the last '/' (the original approach) works for
+    youtu.be/ID or facebook.com/reel/ID, but turns the very common
+    youtube.com/watch?v=ID and facebook.com/watch/?v=ID shapes into
+    "watch?v=ID" or "?v=ID" -- the `v` query parameter is the real ID.
+    """
+    parsed = urlparse(url)
+    video_id = parse_qs(parsed.query).get("v")
+    if video_id and video_id[0]:
+        return video_id[0]
+    return parsed.path.rstrip("/").rsplit("/", 1)[-1] or parsed.netloc or url
+
+
+# Where yt-dlp should borrow sign-in cookies from, so videos that are only
+# visible when logged in (most Facebook videos outside public Pages:
+# friends-only posts, groups, many reels) can be fetched. Stored in
+# QSettings as "cookies_source" ("" / "firefox" / "file") plus
+# "cookies_file". Firefox is the only browser offered on purpose: since
+# Chrome 127 (and Edge, which shares its engine), Windows encrypts their
+# cookies with an app-bound key yt-dlp can't read, so offering them would
+# just be a setting that silently fails. Anyone on Chrome/Edge can export
+# a cookies.txt instead.
+COOKIES_NONE = ""
+COOKIES_FIREFOX = "firefox"
+COOKIES_FILE = "file"
+
+
+def ytdlp_auth_opts() -> dict:
+    """yt-dlp options for the user's chosen sign-in cookies, if any.
+
+    Read fresh from QSettings on every call (QSettings is safe to use from
+    worker threads) so a change in the main window applies to the very
+    next fetch without threading the setting through every caller.
+    """
+    settings = QSettings("TranscriberGUI", "TranscriberGUI")
+    source = settings.value("cookies_source", COOKIES_NONE, type=str)
+    if source == COOKIES_FIREFOX:
+        return {"cookiesfrombrowser": ("firefox",)}
+    if source == COOKIES_FILE:
+        cookie_file = settings.value("cookies_file", "", type=str)
+        if cookie_file:
+            return {"cookiefile": cookie_file}
+    return {}
+
+
+def _is_facebook(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host == "fb.watch" or host.endswith("facebook.com")
+
+
+def explain_download_error(url: str, exc: Exception) -> str:
+    """yt-dlp's own error text, plus a plain-English next step when the
+    likely cause is a Facebook video that needs a signed-in session --
+    yt-dlp's raw message for that case ("Cannot parse data", "login
+    required", ...) doesn't say what to actually do about it."""
+    message = str(exc)
+    if not _is_facebook(url):
+        return message
+    lowered = message.lower()
+    login_hints = ("login", "log in", "logged", "cookies", "cannot parse data", "unsupported url", "private")
+    if any(hint in lowered for hint in login_hints):
+        if ytdlp_auth_opts():
+            message += (
+                "\n\nThis Facebook video still couldn't be read with your sign-in cookies. "
+                "Make sure you're logged in to Facebook in that browser (or re-export "
+                "cookies.txt) and that your account can actually see this video."
+            )
+        else:
+            message += (
+                "\n\nThis Facebook video probably needs you to be signed in. Log in to "
+                "Facebook in Firefox, then set \"Sign in for private videos\" to Firefox "
+                "(or point it at an exported cookies.txt file) and try again."
+            )
+    return message
 
 
 def fetch_video_title(url: str) -> str:
@@ -89,7 +168,7 @@ def fetch_video_title(url: str) -> str:
     pre-fill a suggested filename before a batch actually runs."""
     import yt_dlp
 
-    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, **ytdlp_auth_opts()}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return info.get("title") or url
@@ -102,11 +181,13 @@ def download_audio(
     check_cancelled: Optional[Callable[[], None]] = None,
     on_title: Optional[Callable[[str], None]] = None,
 ) -> str:
-    """Fetch only the audio-only stream from a URL (YouTube, etc.) as a WAV file.
+    """Fetch only the audio-only stream from a URL (YouTube, Facebook, etc.) as a WAV file.
 
-    Never downloads the video track: yt-dlp picks an audio-only format when
-    one is offered (true for virtually all YouTube videos), so this is a
-    small, fast fetch compared to grabbing the full video.
+    Avoids the video track where it can: yt-dlp picks an audio-only format
+    when one is offered (true for virtually all YouTube videos and most
+    Facebook ones), so this is a small, fast fetch compared to grabbing the
+    full video. `bestaudio/best` still falls back to a combined stream for
+    the odd video with no separate audio, which extract_audio() handles.
     """
     import yt_dlp
 
@@ -131,10 +212,20 @@ def download_audio(
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        **ytdlp_auth_opts(),
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        downloaded_path = Path(ydl.prepare_filename(info))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            downloaded_path = Path(ydl.prepare_filename(info))
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 - re-raised with a clearer message
+        # yt-dlp can wrap an exception raised from a progress hook in its
+        # own DownloadError -- a user cancel must still surface as a cancel.
+        if check_cancelled:
+            check_cancelled()
+        raise RuntimeError(explain_download_error(url, exc)) from exc
     if on_title:
         on_title(info.get("title") or info.get("id") or downloaded_path.stem)
     if not downloaded_path.exists():
@@ -303,10 +394,10 @@ class TranscriptionWorker(QObject):
                     )
                     effective_model_size = FALLBACK_MODEL_SIZE
                 elif not is_url(self.video_path):
-                    self.progress.emit("YouTube captions aren't available for local files -- transcribing instead.")
+                    self.progress.emit("Captions aren't available for local files -- transcribing instead.")
                     effective_model_size = FALLBACK_MODEL_SIZE
                 else:
-                    self.progress.emit("Checking for existing YouTube captions...")
+                    self.progress.emit("Checking for existing captions...")
                     from core.captions import fetch_captions
 
                     caption_segments = fetch_captions(
@@ -318,10 +409,10 @@ class TranscriptionWorker(QObject):
                         for seg in caption_segments:
                             self.segment_ready.emit(seg)
                             self._check_cancelled()
-                        self.progress.emit("Done (used existing YouTube captions).")
+                        self.progress.emit("Done (used the video's existing captions).")
                         self.finished.emit(caption_segments)
                         return
-                    self.progress.emit("No YouTube captions found -- transcribing instead.")
+                    self.progress.emit("No captions found -- transcribing instead.")
                     effective_model_size = FALLBACK_MODEL_SIZE
 
             if is_url(self.video_path):
