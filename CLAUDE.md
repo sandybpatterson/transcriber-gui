@@ -184,6 +184,21 @@ confirmed working.
 4. Revisit the Soda Bot integration question with the owner once this has
    seen real use — see the note at the top.
 
+## Self-update from GitHub (added November 2026)
+
+The app runs straight from this git clone (`C:\src	ranscriber-gui`, the
+desktop shortcut uses its `venv`). **Check for updates** in the main window
+(`core/updater.py`) runs `git fetch`, lists new commits, and on Yes does a
+fast-forward `git pull`, re-runs `pip install -r requirements.txt` only if
+that file changed, then relaunches Scribe and closes the old window.
+- Greyed out while a transcription, a batch or a channel check is running
+  (polled once a second); re-checked right before pulling and before
+  restarting -- running work is never killed by an update.
+- Refuses to update if this folder has uncommitted code changes.
+- Workflow: every change is committed and pushed to
+  `sandybpatterson/transcriber-gui`, so other copies can pick it up.
+- The window title shows the running commit, e.g. `Scribe (fcb2553)`.
+
 ---
 
 *Last updated: September 2026*

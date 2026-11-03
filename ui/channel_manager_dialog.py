@@ -76,6 +76,10 @@ class ChannelManagerDialog(QDialog):
         self._diarize = diarize
         self._hf_token = hf_token
 
+    def is_busy(self) -> bool:
+        """True while a channel check is running (blocks self-update)."""
+        return self._thread is not None
+
     def closeEvent(self, event) -> None:
         # Closing this window previously left an active channel check
         # running invisibly in the background -- confirmed, there was no

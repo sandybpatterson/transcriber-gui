@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core import updater
 from core.diarization import verification_key
 from core.engine import (
     COOKIES_FILE,
@@ -104,7 +105,8 @@ class DropZone(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Scribe")
+        version = updater.current_version()
+        self.setWindowTitle(f"Scribe ({version})" if version else "Scribe")
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(900, 700)
@@ -131,7 +133,22 @@ class MainWindow(QMainWindow):
         self._batch_output_dir: Optional[Path] = None
         self._batch_failures: list[str] = []
 
+        # Self-update (check / pull+restart) runs on its own thread so a
+        # slow fetch never freezes the window.
+        self._update_worker: Optional[updater.UpdateWorker] = None
+        self._update_thread: Optional[QThread] = None
+        self._apply_after_check = False
+
         self._build_ui()
+
+        # The channel watcher window starts and finishes jobs on its own,
+        # with no signal back to this window -- polling once a second is
+        # the simplest way to keep the Update button's greyed-out state
+        # honest for both kinds of work.
+        self._update_state_timer = QTimer(self)
+        self._update_state_timer.timeout.connect(self._refresh_update_button)
+        self._update_state_timer.start(1000)
+        self._refresh_update_button()
 
     def closeEvent(self, event) -> None:
         # Confirmed: with no override here, closing the window while a
@@ -184,6 +201,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(url_row)
 
         channels_row = QHBoxLayout()
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.clicked.connect(self._check_for_updates)
+        channels_row.addWidget(self.update_button)
         channels_row.addStretch(1)
         batch_button = QPushButton("Transcribe multiple URLs...")
         batch_button.clicked.connect(self._open_batch_setup)
@@ -768,6 +788,115 @@ class MainWindow(QMainWindow):
         self.export_txt_button.setEnabled(enabled)
         self.export_srt_button.setEnabled(enabled)
         self.export_docx_button.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
+    # Self-update from GitHub
+    # ------------------------------------------------------------------
+    def _is_busy(self) -> bool:
+        """Anything running that an update + restart would kill."""
+        if self._worker is not None or self._batch_queue is not None:
+            return True
+        return self._channel_dialog is not None and self._channel_dialog.is_busy()
+
+    def _refresh_update_button(self) -> None:
+        if self._update_thread is not None:
+            return  # Check/update in progress -- its own handlers own the button.
+        busy = self._is_busy()
+        self.update_button.setEnabled(not busy)
+        self.update_button.setText("Check for updates")
+        self.update_button.setToolTip(
+            "Can't update while a transcription or channel check is running."
+            if busy else "Check GitHub for a newer version of Scribe."
+        )
+
+    def _run_update_worker(self, mode: str) -> None:
+        worker = updater.UpdateWorker(mode)
+        thread = QThread()
+        worker.moveToThread(thread)
+        self._update_worker, self._update_thread = worker, thread
+        thread.started.connect(worker.run)
+        worker.checked.connect(self._on_update_checked)
+        worker.applied.connect(self._on_update_applied)
+        worker.failed.connect(self._on_update_failed)
+        for signal in (worker.checked, worker.applied, worker.failed):
+            signal.connect(thread.quit)
+        thread.finished.connect(self._cleanup_update_thread)
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Checking..." if mode == "check" else "Updating...")
+        thread.start()
+
+    def _cleanup_update_thread(self) -> None:
+        if self.sender() is not self._update_thread:
+            return
+        self._update_worker.deleteLater()
+        self._update_thread.deleteLater()
+        self._update_worker = None
+        self._update_thread = None
+        # The apply step starts only here, once the check's thread is fully
+        # finished -- starting it any earlier let this cleanup run late and
+        # tear down the brand-new apply thread instead (found in testing).
+        if self._apply_after_check:
+            self._apply_after_check = False
+            self._run_update_worker("apply")
+            return
+        self._refresh_update_button()
+
+    def _check_for_updates(self) -> None:
+        if self._is_busy() or self._update_thread is not None:
+            return
+        self._run_update_worker("check")
+
+    def _on_update_checked(self, info) -> None:
+        if not info.available:
+            self.status_label.setText(f"Scribe is up to date ({info.current}).")
+            return
+        changes = "\n".join(f"  • {line}" for line in info.commits[:15])
+        if len(info.commits) > 15:
+            changes += f"\n  …and {len(info.commits) - 15} more"
+        answer = QMessageBox.question(
+            self, "Update available",
+            f"{len(info.commits)} update(s) available ({info.current} → {info.latest}):\n\n"
+            f"{changes}\n\nUpdate now? Scribe will restart afterwards.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        # Something may have been started while the dialog was open.
+        if self._is_busy():
+            QMessageBox.information(
+                self, "Busy", "A transcription or channel check started -- update again once it finishes."
+            )
+            return
+        # The check thread is still winding down at this moment; its
+        # cleanup handler starts the apply step -- unless that cleanup
+        # already ran while the question dialog was open.
+        if self._update_thread is None:
+            self._run_update_worker("apply")
+        else:
+            self._apply_after_check = True
+
+    def _on_update_applied(self, reinstalled: bool) -> None:
+        if self._is_busy():
+            # Never kill running work. The code is already updated on disk;
+            # it takes effect the next time Scribe is opened.
+            self.status_label.setText("Updated -- the new version loads next time Scribe starts.")
+            return
+        self.status_label.setText(
+            "Updated (new requirements installed) -- restarting..." if reinstalled
+            else "Updated -- restarting..."
+        )
+        try:
+            updater.restart()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Restart failed",
+                f"Scribe updated but couldn't restart itself ({exc}). Close and reopen it to finish.",
+            )
+            return
+        QTimer.singleShot(300, self.close)
+
+    def _on_update_failed(self, message: str) -> None:
+        self.status_label.setText("Update failed.")
+        QMessageBox.warning(self, "Update failed", message)
 
     # ------------------------------------------------------------------
     # Export
