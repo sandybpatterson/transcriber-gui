@@ -131,7 +131,14 @@ class MainWindow(QMainWindow):
         self._batch_queue: Optional[list[dict]] = None
         self._batch_index: int = 0
         self._batch_output_dir: Optional[Path] = None
-        self._batch_failures: list[str] = []
+        self._batch_formats: list[str] = [".txt"]
+        # One entry per video in the batch, in queue order:
+        # {"url", "title", "filename", "status", "detail"} with status
+        # "done" / "skipped" / "failed" / "cancelled". This is what the
+        # end-of-batch summary dialog shows, and what a retry re-runs
+        # from. Each to-run queue item also carries its entry under
+        # "_result" so the finish/fail handlers can update it in place.
+        self._batch_results: list[dict] = []
 
         # Self-update (check / pull+restart) runs on its own thread so a
         # slow fetch never freezes the window.
@@ -415,19 +422,43 @@ class MainWindow(QMainWindow):
 
         dialog = BatchSetupDialog(self)
         if dialog.exec() and dialog.queue:
-            self._start_batch(dialog.queue, dialog.output_dir)
+            self._start_batch(dialog.queue, dialog.output_dir, dialog.formats)
 
-    def _start_batch(self, queue: list[dict], output_dir: Path) -> None:
+    def _start_batch(self, queue: list[dict], output_dir: Path, formats: Optional[list[str]] = None) -> None:
         if self._worker is not None:
             QMessageBox.warning(
                 self, "Already running",
                 "A transcription is already in progress. Wait for it to finish, or cancel it, first.",
             )
             return
-        self._batch_queue = queue
-        self._batch_index = 0
+        self._batch_formats = formats or [".txt"]
         self._batch_output_dir = output_dir
-        self._batch_failures = []
+        # A re-run (after a cancel, or a retry) skips videos whose
+        # transcripts are already saved in the output folder, so it
+        # resumes where the last run stopped instead of redoing finished
+        # work and piling up "name (2).txt" copies.
+        self._batch_results = []
+        self._batch_queue = []
+        for item in queue:
+            stem = Path(item["filename"]).stem
+            entry = {
+                "url": item["url"],
+                "title": item.get("title") or item["filename"],
+                "filename": item["filename"],
+                "status": "cancelled",
+                "detail": "",
+            }
+            self._batch_results.append(entry)
+            if all((output_dir / f"{stem}{ext}").exists() for ext in self._batch_formats):
+                entry["status"] = "skipped"
+                entry["detail"] = ", ".join(self._batch_formats)
+            else:
+                item["_result"] = entry
+                self._batch_queue.append(item)
+        if not self._batch_queue:
+            self._finish_batch()
+            return
+        self._batch_index = 0
         self._run_current_batch_item()
 
     def _run_current_batch_item(self) -> None:
@@ -437,16 +468,29 @@ class MainWindow(QMainWindow):
         self._start_transcription()
 
     def _batch_progress_text(self) -> str:
-        return f"({self._batch_index + 1}/{len(self._batch_queue)})"
+        item = self._batch_queue[self._batch_index]
+        name = item.get("title") or item["filename"]
+        return f"({self._batch_index + 1}/{len(self._batch_queue)}) {name}"
 
     def _export_current_batch_item(self, segments) -> None:
         item = self._batch_queue[self._batch_index]
-        out_path = _unique_path(self._batch_output_dir, Path(item["filename"]).stem, ".txt")
+        result = item.get("_result")
+        exporters = {".txt": export_txt, ".srt": export_srt, ".docx": export_docx}
+        saved: list[str] = []
         try:
             self._batch_output_dir.mkdir(parents=True, exist_ok=True)
-            export_txt(segments, str(out_path))
+            for ext in self._batch_formats:
+                out_path = _unique_path(self._batch_output_dir, Path(item["filename"]).stem, ext)
+                exporters[ext](segments, str(out_path))
+                saved.append(out_path.name)
         except OSError as exc:
-            self._batch_failures.append(f"{item['filename']} (save failed: {exc})")
+            if result is not None:
+                result["status"] = "failed"
+                result["detail"] = f"save failed: {exc}"
+            return
+        if result is not None:
+            result["status"] = "done"
+            result["detail"] = ", ".join(saved)
 
     def _advance_or_finish_batch(self) -> None:
         self._batch_index += 1
@@ -456,16 +500,36 @@ class MainWindow(QMainWindow):
         self._run_current_batch_item()
 
     def _finish_batch(self) -> None:
-        total = len(self._batch_queue)
-        failed = len(self._batch_failures)
-        summary = f"Batch complete: {total - failed}/{total} saved to {self._batch_output_dir}"
-        if self._batch_failures:
-            summary += "\nFailed: " + "; ".join(self._batch_failures)
+        results = self._batch_results
+        output_dir = self._batch_output_dir
+        done = sum(1 for r in results if r["status"] == "done")
+        skipped = sum(1 for r in results if r["status"] == "skipped")
+        failed = sum(1 for r in results if r["status"] == "failed")
+        summary = f"Batch complete: {done}/{len(results)} saved to {output_dir}"
+        if skipped:
+            summary += f" ({skipped} already saved)"
+        if failed:
+            summary += f" ({failed} failed)"
         self.status_label.setText(summary)
         self._batch_queue = None
         self._batch_index = 0
         self._batch_output_dir = None
-        self._batch_failures = []
+        self._batch_results = []
+        self._show_batch_summary(results, output_dir)
+
+    def _show_batch_summary(self, results: list[dict], output_dir: Path) -> None:
+        from ui.batch_summary_dialog import BatchSummaryDialog
+
+        dialog = BatchSummaryDialog(results, output_dir, self)
+        if not dialog.exec() or not dialog.retry_requested:
+            return
+        retry_queue = [
+            {"url": r["url"], "filename": r["filename"], "title": r["title"]}
+            for r in results
+            if r["status"] in ("failed", "cancelled")
+        ]
+        if retry_queue:
+            self._start_batch(retry_queue, output_dir, self._batch_formats)
 
     # ------------------------------------------------------------------
     # Transcription
@@ -755,9 +819,13 @@ class MainWindow(QMainWindow):
         if self._batch_queue is not None:
             # One bad link (private video, deleted, typo) shouldn't stop
             # the rest of the batch -- note it and keep going, same
-            # philosophy as the channel watcher's per-video handling.
-            item = self._batch_queue[self._batch_index]
-            self._batch_failures.append(f"{item['filename']} ({message})")
+            # philosophy as the channel watcher's per-video handling. The
+            # reason lands in the end-of-batch summary, where Retry
+            # remaining picks it back up.
+            result = self._batch_queue[self._batch_index].get("_result")
+            if result is not None:
+                result["status"] = "failed"
+                result["detail"] = message
             return
         self.status_label.setText("Failed.")
         note = self._autosave_note()
@@ -767,14 +835,21 @@ class MainWindow(QMainWindow):
         if self.sender() is not self._worker:
             return
         if self._batch_queue is not None:
-            done = self._batch_index
-            total = len(self._batch_queue)
+            done = sum(1 for r in self._batch_results if r["status"] == "done")
+            total = len(self._batch_results)
             self.status_label.setText(f"Batch cancelled after {done}/{total} video(s).")
+            results = self._batch_results
+            output_dir = self._batch_output_dir
             self._batch_queue = None
             self._batch_index = 0
             self._batch_output_dir = None
-            self._batch_failures = []
+            self._batch_results = []
             self._set_export_enabled(bool(self.results_view.segments()))
+            # Videos that never ran stay "cancelled" in the results, so
+            # the summary still shows what got done -- and Retry remaining
+            # picks the batch back up from there instead of from scratch.
+            if any(r["status"] in ("done", "skipped", "failed") for r in results):
+                self._show_batch_summary(results, output_dir)
             return
         self.status_label.setText(f"Cancelled.{self._autosave_note()}")
         self._set_export_enabled(bool(self.results_view.segments()))
