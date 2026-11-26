@@ -201,4 +201,28 @@ that file changed, then relaunches Scribe and closes the old window.
 
 ---
 
+## Batch improvements (added November 2026)
+
+The multi-URL batch flow ("Transcribe multiple URLs...") was reworked
+around the real scenario of pasting several YouTube videos (or a playlist)
+and walking away:
+- A pasted YouTube playlist link expands into its videos
+  (`is_playlist_url` / `expand_playlist_url` in `core/engine.py` -- only a
+  `youtube.com/playlist` page expands; a watch URL carrying `list=` stays
+  one video). Duplicate URLs are dropped.
+- Titles (and lengths) look themselves up shortly after pasting -- the
+  "Look up titles" button is now a manual re-check, and Start works even
+  before the lookup runs (it starts automatically once titles are in).
+- The queue table has a Length column; the batch saves .txt/.srt/.docx as
+  picked in the setup dialog (was .txt only).
+- Re-running a batch skips videos already saved in the output folder, so
+  a cancelled batch resumes instead of redoing finished work.
+- A summary dialog at the end lists Done / Skipped / Failed per video,
+  with "Open output folder" and "Retry remaining" (failed + never-ran
+  only). The status line also names the video currently running.
+- Verified headless against real YouTube metadata (playlist expansion,
+  title+duration lookup, dedupe) in a throwaway venv; the GUI itself was
+  not launched there -- first real check should be a small batch on the
+  Windows PC.
+
 *Last updated: September 2026*
