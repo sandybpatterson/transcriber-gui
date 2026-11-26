@@ -163,15 +163,67 @@ def explain_download_error(url: str, exc: Exception) -> str:
     return message
 
 
-def fetch_video_title(url: str) -> str:
-    """Looks up a video's title without downloading anything -- used to
-    pre-fill a suggested filename before a batch actually runs."""
+def fetch_video_info(url: str) -> tuple[str, Optional[float]]:
+    """Looks up a video's title and duration (seconds, or None if unknown)
+    without downloading anything -- used to pre-fill a batch queue with
+    something meaningful instead of a raw URL fragment."""
     import yt_dlp
 
     ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, **ytdlp_auth_opts()}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-    return info.get("title") or url
+    duration = info.get("duration")
+    return (info.get("title") or url, float(duration) if duration else None)
+
+
+def fetch_video_title(url: str) -> str:
+    """Looks up a video's title without downloading anything -- used to
+    pre-fill a suggested filename before a batch actually runs."""
+    title, _duration = fetch_video_info(url)
+    return title
+
+
+def is_playlist_url(url: str) -> bool:
+    """True if `url` is a YouTube playlist page itself (youtube.com/playlist
+    with a list= parameter) -- the one shape where expanding into the
+    playlist's videos is unambiguous. A watch URL that merely carries a
+    list= parameter (watching one video inside a playlist) is NOT one:
+    the user pasted that one video, not the whole playlist."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host not in ("youtube.com", "www.youtube.com", "music.youtube.com", "www.music.youtube.com"):
+        return False
+    if parsed.path.rstrip("/") != "/playlist":
+        return False
+    return bool(parse_qs(parsed.query).get("list"))
+
+
+def expand_playlist_url(url: str) -> list[str]:
+    """Expands a YouTube playlist URL into its video URLs (flat metadata
+    only, nothing downloaded). Any other URL -- or a playlist that can't
+    be read -- comes back unchanged as a one-item list, so the caller can
+    always treat the result as "the videos this line meant"."""
+    if not is_playlist_url(url):
+        return [url]
+    import yt_dlp
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "noplaylist": False,
+        **ytdlp_auth_opts(),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = info.get("entries") or []
+    urls = []
+    for entry in entries:
+        video_id = (entry or {}).get("id")
+        if video_id:
+            urls.append(f"https://www.youtube.com/watch?v={video_id}")
+    return urls or [url]
 
 
 def download_audio(
